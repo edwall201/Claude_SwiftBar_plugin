@@ -11,9 +11,18 @@
 
 import os
 import sys
+import io
 import json
 import glob
+import base64
+import subprocess
 from datetime import datetime, timezone, timedelta
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAVE_PIL = True
+except Exception:
+    HAVE_PIL = False
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
@@ -45,8 +54,8 @@ DEFAULT = PRICING["sonnet"]
 SESSION_HOURS = 5                 # rolling "Current session" window length
 WEEKLY_RESET_WEEKDAY = 3          # Mon=0 .. Sun=6 ; Thu=3 (match your Settings panel)
 WEEKLY_RESET_HOUR = 17            # local hour of the weekly reset (17 = 5 PM)
-SESSION_BUDGET = 87.0             # calibrated so 5h matches Settings (was 12% at $10.46)
-WEEKLY_BUDGET = 215.0             # calibrated so weekly matches Settings (was 10% at $21.48)
+SESSION_BUDGET = 46.0             # calibrated vs Settings Pro panel: $34.33 -> 75% (Jun 2026)
+WEEKLY_BUDGET = 344.0             # calibrated vs Settings Pro panel: $65.29 -> 19% (Jun 2026)
 
 
 def rates_for(model):
@@ -189,11 +198,107 @@ def frac(cost, budget, peak):
     return cost / peak if peak > 0 else 0.0
 
 
+def is_dark_mode():
+    """True when macOS is in Dark mode (so the menu background is dark)."""
+    try:
+        out = subprocess.run(
+            ["defaults", "read", "-g", "AppleInterfaceStyle"],
+            capture_output=True, text=True, timeout=2)
+        return "dark" in (out.stdout or "").strip().lower()
+    except Exception:
+        return False
+
+
+def _load_font(size):
+    for p in ("/System/Library/Fonts/SFNS.ttf",
+              "/System/Library/Fonts/SFNSDisplay.ttf",
+              "/System/Library/Fonts/Helvetica.ttc",
+              "/System/Library/Fonts/Supplemental/Arial.ttf"):
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def _level_color(fr):
+    """Calm blue normally; warn orange/red as a limit fills up."""
+    if fr >= 0.85:
+        return (255, 69, 58)        # red
+    if fr >= 0.60:
+        return (255, 159, 10)       # orange
+    return (47, 98, 224)            # blue
+
+
+def render_panel(rows):
+    """Render the whole usage panel as one crisp base64 PNG. An image menu item
+    keeps full color (macOS doesn't dim it like grey text) and isn't a row of
+    clickable buttons. Returns a base64 string, or None on any failure."""
+    try:
+        S = 2                       # supersample, paired with 144 DPI => retina
+        W = 300                     # logical width (compact). The menu may show a
+        #                             slightly larger right margin than left because it
+        #                             reserves trailing space for the SwiftBar arrow.
+        pad = 14
+        row_h = 38
+        div_gap = 12
+        top = 11
+        bot = 9
+        n = len(rows)
+        ndiv = sum(1 for r in rows if r.get("divider"))
+        H = top + row_h * n + div_gap * ndiv + bot
+
+        dark = is_dark_mode()
+        text_col = (245, 245, 247) if dark else (29, 29, 31)
+        sub_col = (152, 152, 160) if dark else (120, 120, 128)
+        track_col = (74, 74, 78) if dark else (224, 224, 230)
+        div_col = (255, 255, 255, 28) if dark else (0, 0, 0, 24)
+
+        img = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        f_label = _load_font(12 * S)
+        f_value = _load_font(10 * S)
+
+        y = top * S
+        inner = (W - 2 * pad) * S
+        for r in rows:
+            if r.get("divider"):
+                y += div_gap * S
+                ly = y - (div_gap // 2) * S
+                d.line([(pad * S, ly), ((W - pad) * S, ly)],
+                       fill=div_col, width=max(1, S))
+            d.text((pad * S, y), r["label"], font=f_label, fill=text_col)
+            vw = d.textlength(r["value"], font=f_value)
+            d.text((W * S - pad * S - vw, y + 2 * S), r["value"],
+                   font=f_value, fill=sub_col)
+            by = y + 20 * S
+            bh = 7 * S
+            rad = bh / 2.0
+            d.rounded_rectangle([pad * S, by, pad * S + inner, by + bh],
+                                radius=rad, fill=track_col)
+            fr = max(0.0, min(1.0, r["frac"]))
+            if fr > 0:
+                fw = max(bh, inner * fr)
+                d.rounded_rectangle([pad * S, by, pad * S + fw, by + bh],
+                                    radius=rad, fill=_level_color(fr))
+            y += row_h * S
+
+        buf = io.BytesIO()
+        dpi = 72 * S
+        img.save(buf, format="PNG", dpi=(dpi, dpi))
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
+
+
 def main():
     entries, latest = collect()
     now = datetime.now(timezone.utc).astimezone()
-    BLUE = "#3B6FE0"
-    BAR_W = 30
+    BLUE = "#2F62E0"          # solid bar color
+    INK = "#000000"          # solid dropdown text
+    TXT = "Menlo-Bold"       # bold so vibrancy doesn't wash it to grey
+    BAR_W = 40
 
     # rolling 5h session
     time_costs = sorted((ts.astimezone(), cost) for ts, model, cost, tokens in entries if ts)
@@ -225,21 +330,32 @@ def main():
     print("| templateImage={}".format(MONSTER_B64))
     print("---")
     if not entries:
-        print("No Claude Code usage found | color=gray")
+        print("No Claude Code usage found")
         print("Refresh | refresh=true")
         return
 
-    print("Context window   {:.1f}k / {:.0f}k ({:.0f}%) | font=Menlo".format(
-        ctx_tok / 1000, ctx_max / 1000, ctx_frac * 100))
-    print("{} | font=Menlo color={}".format(pct_bar(ctx_frac, BAR_W), BLUE))
-    print("---")
-    print("Plan usage | font=Menlo")
-    sess_reset_txt = "resets in " + fmt_hm(session_reset - now) if session_active else "ready"
-    print("5-hour limit   {:.0f}% · {} | font=Menlo".format(sess_frac * 100, sess_reset_txt))
-    print("{} | font=Menlo color={}".format(pct_bar(sess_frac, BAR_W), BLUE))
-    print("Weekly · all models   {:.0f}% · resets in {} | font=Menlo".format(
-        wk_frac * 100, fmt_hm(weekly_reset - now)))
-    print("{} | font=Menlo color={}".format(pct_bar(wk_frac, BAR_W), BLUE))
+    # The dropdown is rendered as a single image so the text stays crisp and dark
+    # (macOS dims grey *text* items, and making them clickable turns every line
+    # into a highlightable button). An image item is neither dimmed nor a button.
+    ctx_value = "{:.1f}k / {:.0f}k · {:.0f}%".format(
+        ctx_tok / 1000, ctx_max / 1000, ctx_frac * 100)
+    sess_value = ("{:.0f}% · resets {}".format(sess_frac * 100, fmt_hm(session_reset - now))
+                  if session_active else "ready")
+    wk_value = "{:.0f}% · resets {}".format(wk_frac * 100, fmt_hm(weekly_reset - now))
+    rows = [
+        {"label": "Context window", "value": ctx_value, "frac": ctx_frac, "divider": False},
+        {"label": "5-hour limit", "value": sess_value, "frac": sess_frac, "divider": True},
+        {"label": "Weekly · all models", "value": wk_value, "frac": wk_frac, "divider": False},
+    ]
+
+    panel = render_panel(rows) if HAVE_PIL else None
+    if panel:
+        print("| image={}".format(panel))
+    else:
+        # Fallback (no PIL): plain text rows, no refresh=true so they aren't buttons.
+        for r in rows:
+            print("{}  {} | font={} color={}".format(r["label"], r["value"], TXT, INK))
+            print("{} | font=Menlo color={}".format(pct_bar(r["frac"], BAR_W), BLUE))
     print("---")
     print("Refresh | refresh=true")
 

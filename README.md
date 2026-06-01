@@ -44,8 +44,11 @@ against the official Settings panel via `SESSION_BUDGET` / `WEEKLY_BUDGET`.
 
 ## Tuning
 
-- Icon size in the menu bar: `PAD_Y` in `icon_gen.py` (more padding → smaller icon).
-- Progress bar length: `BAR_W` in `claude-usage.10m.py`.
+- Icon size in the menu bar: `ICON_POINT_H` in `icon_gen.py` (lower → smaller icon).
+- Dropdown panel: the breakdown is drawn as a single image in `render_panel()`
+  (`claude-usage.10m.py`) so the text stays crisp and dark and the rows aren't
+  clickable buttons. Tune `W` / `row_h` for size and `_level_color()` for the
+  bar colors. Colors auto-adapt to macOS light/dark mode.
 - Percentage calibration: `SESSION_BUDGET` / `WEEKLY_BUDGET`.
 
 After editing the icon, run `python3 icon_gen.py`, then force-restart SwiftBar
