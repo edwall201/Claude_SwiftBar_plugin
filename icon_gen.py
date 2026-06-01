@@ -37,18 +37,21 @@ for r, line in enumerate(GRID):
                 for x in range(c * CELL, c * CELL + CELL):
                     px[x, y] = WHITE
 
-# Center the creature in a large SQUARE transparent canvas. SwiftBar scales the
-# whole image to fit the bar, so a small creature in a big square shrinks it
-# regardless of whether width or height drives the scaling.
-# Smaller CREATURE_FRACTION -> smaller icon in the menu bar.
-CREATURE_FRACTION = 0.18
-side = int(max(img.width, img.height) / CREATURE_FRACTION)
-canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-canvas.alpha_composite(img, ((side - img.width) // 2, (side - img.height) // 2))
+# Small transparent margin so the creature isn't edge-to-edge.
+PAD = 4
+canvas = Image.new("RGBA", (img.width + 2 * PAD, img.height + 2 * PAD), (0, 0, 0, 0))
+canvas.alpha_composite(img, (PAD, PAD))
 img = canvas
 
+# Control the on-screen size via the PNG's DPI. macOS renders a menu-bar image at
+# its POINT size (points = pixels * 72 / dpi), clamped to the bar height, so a
+# higher DPI makes a physically smaller icon. We target a fixed point height:
+# LOWER ICON_POINT_H -> smaller icon in the menu bar.
+ICON_POINT_H = 13
+dpi = img.height * 72.0 / ICON_POINT_H
+
 png_path = "/Users/huangyukai/cluade_usage/monster.png"
-img.save(png_path)
+img.save(png_path, dpi=(dpi, dpi))
 with open(png_path, "rb") as fh:
     b64 = base64.b64encode(fh.read()).decode()
 with open("/Users/huangyukai/cluade_usage/monster.b64", "w") as fh:
