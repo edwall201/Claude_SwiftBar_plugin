@@ -1,54 +1,50 @@
 #!/usr/bin/env python3
-"""Generate the orange Claude-monster icon (colored PNG) for the SwiftBar menu bar.
-This is a COLOR icon, so the plugin uses `image=` (not `templateImage=`) to keep
-the orange. Tweak colors/shapes here and re-run, then paste the base64 into the plugin."""
+"""Generate the white pixel-art Claude-invader icon for the SwiftBar menu bar.
+The plugin uses `templateImage=` so macOS tints it to the menu-bar label color
+(white on a dark bar) and it auto-adapts to light/dark mode. Only the alpha
+channel matters for a template image; eyes and gaps are transparent so the bar
+shows through. Edit the GRID below and re-run; the re-embed step pastes the
+base64 into the plugin."""
 import base64
-from PIL import Image, ImageDraw
+from PIL import Image
 
-SS = 8                      # supersample for smooth edges
-W, H = 34, 36
-img = Image.new("RGBA", (W * SS, H * SS), (0, 0, 0, 0))
-d = ImageDraw.Draw(img)
+WHITE = (255, 255, 255, 255)        # template image is tinted by macOS anyway
 
-ORANGE = (217, 119, 87, 255)     # Claude coral/orange
-DARK = (74, 47, 37, 255)         # eyes/mouth
-WHITE = (255, 248, 244, 255)
+# '#' = orange pixel, '.' = transparent. Classic space-invader silhouette:
+# wide top block, two vertical eye slots, full-width side arms, six legs.
+GRID = [
+    "..############..",
+    "..############..",
+    "..##.######.##..",
+    "..##.######.##..",
+    "################",
+    "################",
+    "################",
+    "..############..",
+    "..############..",
+    "..#.#.#..#.#.#..",
+    "..#.#.#..#.#.#..",
+]
 
+CELL = 8                            # px per grid cell
+rows, cols = len(GRID), len(GRID[0])
+img = Image.new("RGBA", (cols * CELL, rows * CELL), (0, 0, 0, 0))
+px = img.load()
+for r, line in enumerate(GRID):
+    for c, ch in enumerate(line):
+        if ch == "#":
+            for y in range(r * CELL, r * CELL + CELL):
+                for x in range(c * CELL, c * CELL + CELL):
+                    px[x, y] = WHITE
 
-def s(*v):
-    return [x * SS for x in v]
-
-
-# --- little horns ---
-d.polygon(s(9, 8, 13, 8, 11, 1), fill=ORANGE)
-d.polygon(s(21, 8, 25, 8, 23, 1), fill=ORANGE)
-
-# --- body: rounded blob ---
-d.rounded_rectangle(s(4, 6, 30, 30), radius=11 * SS, fill=ORANGE)
-
-# --- feet ---
-d.ellipse(s(7, 26, 15, 34), fill=ORANGE)
-d.ellipse(s(19, 26, 27, 34), fill=ORANGE)
-
-# --- eyes (white with dark pupils) ---
-d.ellipse(s(9, 12, 16, 21), fill=WHITE)
-d.ellipse(s(18, 12, 25, 21), fill=WHITE)
-d.ellipse(s(11, 15, 15, 20), fill=DARK)
-d.ellipse(s(20, 15, 24, 20), fill=DARK)
-# eye glints
-d.ellipse(s(12, 15, 13, 16), fill=WHITE)
-d.ellipse(s(21, 15, 22, 16), fill=WHITE)
-
-# --- small smile ---
-d.arc(s(13, 20, 21, 26), start=15, end=165, fill=DARK, width=2 * SS)
-
-img = img.resize((W, H), Image.LANCZOS)
-
-# Pad with transparency so SwiftBar scales the visible creature smaller in the bar.
-PAD_Y = 16          # vertical padding (more padding -> smaller icon in the menu bar)
-PAD_X = 6
-canvas = Image.new("RGBA", (W + 2 * PAD_X, H + 2 * PAD_Y), (0, 0, 0, 0))
-canvas.alpha_composite(img, (PAD_X, PAD_Y))
+# Center the creature in a large SQUARE transparent canvas. SwiftBar scales the
+# whole image to fit the bar, so a small creature in a big square shrinks it
+# regardless of whether width or height drives the scaling.
+# Smaller CREATURE_FRACTION -> smaller icon in the menu bar.
+CREATURE_FRACTION = 0.18
+side = int(max(img.width, img.height) / CREATURE_FRACTION)
+canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+canvas.alpha_composite(img, ((side - img.width) // 2, (side - img.height) // 2))
 img = canvas
 
 png_path = "/Users/huangyukai/cluade_usage/monster.png"
