@@ -237,14 +237,14 @@ def render_panel(rows):
     clickable buttons. Returns a base64 string, or None on any failure."""
     try:
         S = 2                       # supersample, paired with 144 DPI => retina
-        W = 300                     # logical width (compact). The menu may show a
-        #                             slightly larger right margin than left because it
-        #                             reserves trailing space for the SwiftBar arrow.
+        W = 370                     # logical width. Wider => smaller right margin
+        #                             (the menu reserves trailing space on the right
+        #                             for the SwiftBar submenu arrow).
         pad = 14
-        row_h = 38
+        row_h = 42
         div_gap = 12
-        top = 11
-        bot = 9
+        top = 12
+        bot = 10
         n = len(rows)
         ndiv = sum(1 for r in rows if r.get("divider"))
         H = top + row_h * n + div_gap * ndiv + bot
@@ -257,8 +257,8 @@ def render_panel(rows):
 
         img = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        f_label = _load_font(12 * S)
-        f_value = _load_font(10 * S)
+        f_label = _load_font(14 * S)
+        f_value = _load_font(12 * S)
 
         y = top * S
         inner = (W - 2 * pad) * S
@@ -270,10 +270,10 @@ def render_panel(rows):
                        fill=div_col, width=max(1, S))
             d.text((pad * S, y), r["label"], font=f_label, fill=text_col)
             vw = d.textlength(r["value"], font=f_value)
-            d.text((W * S - pad * S - vw, y + 2 * S), r["value"],
+            d.text((W * S - pad * S - vw, y + 3 * S), r["value"],
                    font=f_value, fill=sub_col)
-            by = y + 20 * S
-            bh = 7 * S
+            by = y + 24 * S
+            bh = 8 * S
             rad = bh / 2.0
             d.rounded_rectangle([pad * S, by, pad * S + inner, by + bh],
                                 radius=rad, fill=track_col)

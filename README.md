@@ -32,12 +32,12 @@ against the official Settings panel via `SESSION_BUDGET` / `WEEKLY_BUDGET`.
    defaults write com.ameba.SwiftBar PluginDirectory "$(pwd)/plugins"
    open -a SwiftBar
    ```
-3. The plugin file is `plugins/claude-usage.10m.py` — the `10m` means it refreshes
-   every 10 minutes.
+3. The plugin file is `plugins/claude-usage.30s.py` — the `30s` means it auto-refreshes
+   every 30 seconds, so the numbers stay close to live without pressing Refresh.
 
 ## Files
 
-- `plugins/claude-usage.10m.py` — the SwiftBar plugin (reads logs, renders the panel).
+- `plugins/claude-usage.30s.py` — the SwiftBar plugin (reads logs, renders the panel).
 - `icon_gen.py` — regenerates the orange monster icon (PIL/Pillow) and re-embeds
   the base64 into the plugin.
 - `monster.png` / `monster.b64` — the generated icon.
@@ -46,7 +46,7 @@ against the official Settings panel via `SESSION_BUDGET` / `WEEKLY_BUDGET`.
 
 - Icon size in the menu bar: `ICON_POINT_H` in `icon_gen.py` (lower → smaller icon).
 - Dropdown panel: the breakdown is drawn as a single image in `render_panel()`
-  (`claude-usage.10m.py`) so the text stays crisp and dark and the rows aren't
+  (`claude-usage.30s.py`) so the text stays crisp and dark and the rows aren't
   clickable buttons. Tune `W` / `row_h` for size and `_level_color()` for the
   bar colors. Colors auto-adapt to macOS light/dark mode.
 - Percentage calibration: `SESSION_BUDGET` / `WEEKLY_BUDGET`.
