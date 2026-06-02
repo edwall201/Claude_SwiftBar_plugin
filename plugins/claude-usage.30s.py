@@ -26,6 +26,27 @@ except Exception:
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
+# The session / weekly numbers come from Anthropic's own usage endpoint — the
+# exact data behind Settings › Usage — authenticated with your claude.ai browser
+# cookie. We keep the cookie and a small cache of the last good response under
+# ~/.claude (outside the repo). The cookie is a live session credential, so the
+# file is written 0600 (user-only) and never printed in the menu.
+COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_cookie")
+CACHE_FILE = os.path.expanduser("~/.claude/.usage_monitor_cache.json")
+USAGE_URL = "https://claude.ai/api/organizations/{org}/usage"
+BOOTSTRAP_URL = "https://claude.ai/api/bootstrap"
+# Look like the website so the endpoint answers the same way it does in-browser.
+USAGE_HEADERS = {
+    "Accept": "*/*",
+    "Content-Type": "application/json",
+    "Origin": "https://claude.ai",
+    "Referer": "https://claude.ai",
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36"),
+    "authority": "claude.ai",
+}
+
 # White pixel-art Claude-invader icon (regenerate with icon_gen.py).
 # Used with `templateImage=` so macOS tints it to the menu-bar label color.
 MONSTER_B64 = (
@@ -45,17 +66,6 @@ PRICING = {
     "haiku":  {"in": 1.0,  "out": 5.0,  "cache_read": 0.10},
 }
 DEFAULT = PRICING["sonnet"]
-
-# ---- Plan usage limits (mirrors Settings > Plan usage limits) ----
-# These windows are computed accurately from local logs. The *percentage* needs a
-# limit that Anthropic does not expose locally, so calibrate it once against the
-# official panel:  budget = window_cost / (percent_shown / 100)
-# Leave a budget None to instead gauge against your own historical peak.
-SESSION_HOURS = 5                 # rolling "Current session" window length
-WEEKLY_RESET_WEEKDAY = 3          # Mon=0 .. Sun=6 ; Thu=3 (match your Settings panel)
-WEEKLY_RESET_HOUR = 17            # local hour of the weekly reset (17 = 5 PM)
-SESSION_BUDGET = 46.0             # calibrated vs Settings Pro panel: $34.33 -> 75% (Jun 2026)
-WEEKLY_BUDGET = 344.0             # calibrated vs Settings Pro panel: $65.29 -> 19% (Jun 2026)
 
 
 def rates_for(model):
@@ -165,37 +175,153 @@ def fmt_hm(delta):
     return "{}m".format(mins)
 
 
-def weekly_anchor(dt, weekday, hour):
-    """Most recent weekly-reset boundary at/just before dt."""
-    cand = dt.replace(hour=hour, minute=0, second=0, microsecond=0)
-    cand -= timedelta(days=(dt.weekday() - weekday) % 7)
-    if cand > dt:
-        cand -= timedelta(days=7)
-    return cand
+def read_cookie():
+    """Return the saved claude.ai cookie string, or '' if unset."""
+    try:
+        with open(COOKIE_FILE) as fh:
+            return fh.read().strip()
+    except Exception:
+        return ""
 
 
-def build_sessions(time_costs, hours):
-    """Group (dt, cost) into rolling sessions; a new session starts when a message
-    lands >= `hours` after the current session's start. Returns [(start, cost), ...]."""
-    span = timedelta(hours=hours)
-    sessions = []
-    start, acc = None, 0.0
-    for dt, c in time_costs:
-        if start is None or dt >= start + span:
-            if start is not None:
-                sessions.append((start, acc))
-            start, acc = dt, 0.0
-        acc += c
-    if start is not None:
-        sessions.append((start, acc))
-    return sessions
+def save_cookie(cookie):
+    """Persist the cookie privately (0600) so only the user account can read it."""
+    try:
+        os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
+        with open(COOKIE_FILE, "w") as fh:
+            fh.write(cookie.strip())
+        os.chmod(COOKIE_FILE, 0o600)
+    except Exception:
+        pass
 
 
-def frac(cost, budget, peak):
-    """Usage fraction: vs the calibrated budget if set, else vs your own peak."""
-    if budget and budget > 0:
-        return cost / budget
-    return cost / peak if peak > 0 else 0.0
+def clear_cookie():
+    try:
+        os.remove(COOKIE_FILE)
+    except Exception:
+        pass
+
+
+def org_id_from_cookie(cookie):
+    """The cookie usually carries lastActiveOrg=<uuid>; pull it straight out."""
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith("lastActiveOrg="):
+            return part[len("lastActiveOrg="):]
+    return None
+
+
+class _HttpError(Exception):
+    """A non-200 status from the usage endpoint (carries the HTTP code)."""
+    def __init__(self, code):
+        super().__init__("HTTP {}".format(code))
+        self.code = code
+
+
+def _get_json(url, cookie, timeout=8):
+    """GET a claude.ai JSON endpoint through the system curl. curl uses macOS's own
+    trust store, so this works regardless of how the Python install's CA bundle is
+    configured (the stock python.org build often has none) — the same networking
+    the website itself uses. Returns the parsed dict; raises _HttpError(code) on a
+    non-200 response, or OSError if curl itself fails (network down, etc.).
+
+    `--http1.1` is essential: over HTTP/2 Cloudflare fingerprints the (non-browser)
+    client and serves its 403 "Just a moment…" JS challenge; forcing HTTP/1.1 makes
+    the same request answer 200, the way the browser's own XHR does."""
+    args = ["/usr/bin/curl", "--silent", "--show-error", "--http1.1",
+            "--max-time", str(timeout),
+            "-H", "Cookie: " + cookie, "-w", "\n%{http_code}"]
+    for k, v in USAGE_HEADERS.items():
+        args += ["-H", "{}: {}".format(k, v)]
+    args.append(url)
+    out = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 5)
+    if out.returncode != 0:
+        raise OSError(out.stderr.strip() or "curl exit {}".format(out.returncode))
+    body, _, code = out.stdout.rpartition("\n")
+    try:
+        status = int(code.strip())
+    except ValueError:
+        status = 0
+    if status != 200:
+        raise _HttpError(status)
+    return json.loads(body)
+
+
+def get_org_id(cookie):
+    """Org id from the cookie if present, else from the bootstrap endpoint."""
+    oid = org_id_from_cookie(cookie)
+    if oid:
+        return oid
+    try:
+        data = _get_json(BOOTSTRAP_URL, cookie)
+        return (data.get("account") or {}).get("lastActiveOrgId")
+    except Exception:
+        return None
+
+
+def fetch_usage(cookie):
+    """Hit Anthropic's official usage endpoint. Returns (data, error): data is the
+    raw JSON dict (five_hour / seven_day / seven_day_sonnet) or None; error is a
+    short tag — 'nocookie', 'noorg', 'auth' (expired), 'net', or 'httpNNN'."""
+    if not cookie:
+        return None, "nocookie"
+    org = get_org_id(cookie)
+    if not org:
+        return None, "noorg"
+    try:
+        return _get_json(USAGE_URL.format(org=org), cookie), None
+    except _HttpError as e:
+        return None, "auth" if e.code in (401, 403) else "http{}".format(e.code)
+    except Exception:
+        return None, "net"
+
+
+def usage_window(data, key):
+    """(utilization_fraction, resets_at_datetime) for one window key, or None when
+    the key is absent. The API reports utilization 0..100; we return 0..1."""
+    w = (data or {}).get(key)
+    if not isinstance(w, dict):
+        return None
+    util = w.get("utilization")
+    fr = (float(util) / 100.0) if isinstance(util, (int, float)) else 0.0
+    return fr, parse_ts(w.get("resets_at"))
+
+
+def load_cache():
+    try:
+        with open(CACHE_FILE) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def save_cache(data):
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        with open(CACHE_FILE, "w") as fh:
+            json.dump(data, fh)
+    except Exception:
+        pass
+
+
+def prompt_cookie():
+    """Pop a native dialog to paste the cookie, then save it. Invoked by the
+    dropdown 'Set cookie…' item (which re-runs this script with --set-cookie)."""
+    msg = ("Paste your claude.ai cookie.\\n\\n"
+           "claude.ai → Settings → Usage, open DevTools (⌥⌘I) → Network, refresh "
+           "the page, click the 'usage' request, then copy the whole 'Cookie' "
+           "value from its Request Headers.")
+    osa = ('set t to text returned of (display dialog "{}" default answer "" '
+           'with title "Claude Usage — set cookie" buttons {{"Cancel", "Save"}} '
+           'default button "Save")').format(msg)
+    try:
+        out = subprocess.run(["osascript", "-e", osa],
+                             capture_output=True, text=True, timeout=180)
+        cookie = (out.stdout or "").strip()
+        if cookie:
+            save_cookie(cookie)
+    except Exception:
+        pass
 
 
 def is_dark_mode():
@@ -293,60 +419,53 @@ def render_panel(rows):
 
 
 def main():
-    entries, latest = collect()
+    _, latest = collect()
     now = datetime.now(timezone.utc).astimezone()
     BLUE = "#2F62E0"          # solid bar color
     INK = "#000000"          # solid dropdown text
     TXT = "Menlo-Bold"       # bold so vibrancy doesn't wash it to grey
     BAR_W = 40
+    script = os.path.abspath(__file__)
 
-    # rolling 5h session
-    time_costs = sorted((ts.astimezone(), cost) for ts, model, cost, tokens in entries if ts)
-    span = timedelta(hours=SESSION_HOURS)
-    sessions = build_sessions(time_costs, SESSION_HOURS)
-    session_active = bool(sessions) and now < sessions[-1][0] + span
-    session_cost = sessions[-1][1] if session_active else 0.0
-    session_peak = max((c for _, c in sessions), default=0.0)
-    session_reset = sessions[-1][0] + span if session_active else None
-    sess_frac = frac(session_cost, SESSION_BUDGET, session_peak)
-
-    # weekly window
-    weekly_buckets = {}
-    for dt, c in time_costs:
-        a = weekly_anchor(dt, WEEKLY_RESET_WEEKDAY, WEEKLY_RESET_HOUR)
-        weekly_buckets[a] = weekly_buckets.get(a, 0.0) + c
-    cur_anchor = weekly_anchor(now, WEEKLY_RESET_WEEKDAY, WEEKLY_RESET_HOUR)
-    weekly_cost = weekly_buckets.get(cur_anchor, 0.0)
-    weekly_peak = max(weekly_buckets.values(), default=0.0)
-    weekly_reset = cur_anchor + timedelta(days=7)
-    wk_frac = frac(weekly_cost, WEEKLY_BUDGET, weekly_peak)
-
-    # context window (latest assistant turn)
+    # Context window (latest assistant turn) — the one figure the official API
+    # doesn't expose, so we still derive it from the local transcripts.
     ctx_max = 200_000
     ctx_tok = latest[1] if latest else 0
     ctx_frac = ctx_tok / ctx_max
+    ctx_value = "{:.1f}k / {:.0f}k · {:.0f}%".format(
+        ctx_tok / 1000, ctx_max / 1000, ctx_frac * 100)
+
+    # Session + weekly: the real numbers straight from Anthropic's usage endpoint.
+    cookie = read_cookie()
+    data, err = fetch_usage(cookie)
+    stale = False
+    if data is not None:
+        save_cache(data)                 # remember the last good snapshot
+    elif err == "net":
+        data = load_cache()              # transient outage: show what we last saw
+        stale = data is not None
 
     # menu bar: white invader icon (template image auto-tints to the bar color)
     print("| templateImage={}".format(MONSTER_B64))
     print("---")
-    if not entries:
-        print("No Claude Code usage found")
-        print("Refresh | refresh=true")
-        return
 
-    # The dropdown is rendered as a single image so the text stays crisp and dark
-    # (macOS dims grey *text* items, and making them clickable turns every line
-    # into a highlightable button). An image item is neither dimmed nor a button.
-    ctx_value = "{:.1f}k / {:.0f}k · {:.0f}%".format(
-        ctx_tok / 1000, ctx_max / 1000, ctx_frac * 100)
-    sess_value = ("{:.0f}% · resets {}".format(sess_frac * 100, fmt_hm(session_reset - now))
-                  if session_active else "ready")
-    wk_value = "{:.0f}% · resets {}".format(wk_frac * 100, fmt_hm(weekly_reset - now))
-    rows = [
-        {"label": "Context window", "value": ctx_value, "frac": ctx_frac, "divider": False},
-        {"label": "5-hour limit", "value": sess_value, "frac": sess_frac, "divider": True},
-        {"label": "Weekly · all models", "value": wk_value, "frac": wk_frac, "divider": False},
-    ]
+    # Build rows. The dropdown is rendered as one image so the text stays crisp
+    # and dark (macOS dims grey *text* items, and making them clickable turns
+    # every line into a highlightable button); an image is neither.
+    rows = [{"label": "Context window", "value": ctx_value,
+             "frac": ctx_frac, "divider": False}]
+    for key, label, div in (("five_hour", "5-hour limit", True),
+                            ("seven_day", "Weekly · all models", False),
+                            ("seven_day_sonnet", "Weekly · Sonnet", False)):
+        w = usage_window(data, key)
+        if not w:
+            continue
+        fr, reset = w
+        if reset and reset.astimezone() > now:
+            value = "{:.0f}% · resets {}".format(fr * 100, fmt_hm(reset.astimezone() - now))
+        else:
+            value = "{:.0f}%".format(fr * 100)
+        rows.append({"label": label, "value": value, "frac": fr, "divider": div})
 
     panel = render_panel(rows) if HAVE_PIL else None
     if panel:
@@ -356,9 +475,33 @@ def main():
         for r in rows:
             print("{}  {} | font={} color={}".format(r["label"], r["value"], TXT, INK))
             print("{} | font=Menlo color={}".format(pct_bar(r["frac"], BAR_W), BLUE))
+
+    # Status line + cookie actions.
     print("---")
+    if data is None:
+        hint = {
+            "nocookie": "Set your claude.ai cookie to show limits",
+            "noorg": "Couldn't find your org id — re-set the cookie",
+            "auth": "Cookie expired — set it again",
+            "net": "Couldn't reach claude.ai (offline?)",
+        }.get(err, "Couldn't load usage ({})".format(err))
+        print("⚠ {} | color=#cc6600".format(hint))
+    elif stale:
+        print("⚠ showing last good data (couldn't refresh) | color=#999999 size=11")
+
+    if cookie:
+        print("Update cookie… | bash=\"{}\" param1=--set-cookie terminal=false refresh=true".format(script))
+        print("Clear cookie | bash=\"{}\" param1=--clear-cookie terminal=false refresh=true".format(script))
+    else:
+        print("Set claude.ai cookie… | bash=\"{}\" param1=--set-cookie terminal=false refresh=true".format(script))
     print("Refresh | refresh=true")
 
 
 if __name__ == "__main__":
-    main()
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--set-cookie":
+        prompt_cookie()
+    elif arg == "--clear-cookie":
+        clear_cookie()
+    else:
+        main()
