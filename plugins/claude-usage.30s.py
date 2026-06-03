@@ -4,6 +4,12 @@
 # <bitbar.author>edward</bitbar.author>
 # <bitbar.desc>Shows local Claude Code token usage and computed cost.</bitbar.desc>
 # <swiftbar.environment>[]</swiftbar.environment>
+# Hide SwiftBar's default footer. The "SwiftBar" item is a submenu, and macOS
+# reserves a disclosure-arrow gutter on the right of every row whenever any item
+# has a submenu — that gutter is dead space the panel image can't fill. Dropping
+# it (and the noisy "Updated … ago" line) lets the panel define the menu width.
+# <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
+# <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
 #
 # SwiftBar/xbar plugin. Reads Claude Code transcripts from ~/.claude/projects,
 # sums token usage per time window, and estimates USD cost from public pricing.
@@ -363,10 +369,12 @@ def render_panel(rows):
     clickable buttons. Returns a base64 string, or None on any failure."""
     try:
         S = 2                       # supersample, paired with 144 DPI => retina
-        W = 370                     # logical width. Wider => smaller right margin
-        #                             (the menu reserves trailing space on the right
-        #                             for the SwiftBar submenu arrow).
-        pad = 14
+        W = 300                     # logical width. With the submenu footer hidden
+        #                             (see header) the panel is the widest row, so
+        #                             W sets the menu width directly — no reserved
+        #                             arrow gutter to leave blank space on the right.
+        pad = 8                     # left+right inner margin (smaller => content
+        #                             hugs both edges of the panel more tightly)
         row_h = 42
         div_gap = 12
         top = 12
