@@ -2,7 +2,7 @@
 
 A [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin that puts your Claude
 usage in the macOS menu bar — the same numbers as Claude's `/usage` popover:
-**context window**, **5-hour limit**, **weekly** usage, and optionally your
+**5-hour limit**, **weekly** usage, and optionally your
 **API credit balance**, each with a progress bar and a live reset countdown.
 
 ![icon](monster.png)
@@ -35,9 +35,10 @@ refreshes every 30 seconds automatically.
 
 Click the monster icon to open the panel:
 
+![panel](panel.png)
+
 | Row | What it shows |
 |-----|--------------|
-| **Context window** | How full the current Claude Code conversation is (out of the 200 k-token limit). Derived from local transcripts — no cookie needed. |
 | **5-hour limit** | Your rolling 5-hour usage, percentage used + time until reset. |
 | **Weekly · all models** | 7-day usage across all models. |
 | **Weekly · Sonnet** | 7-day Sonnet-only usage (shown only when Anthropic reports it separately). |
@@ -155,11 +156,6 @@ The `30s` in the filename tells SwiftBar to auto-refresh every 30 seconds.
 fingerprinting. `utilization` percentages and `resets_at` times come directly
 from Anthropic, so they match the official panel exactly.
 
-**Context window:** no server endpoint exists for this, so the plugin reads
-your local Claude Code transcripts (`~/.claude/projects/**/*.jsonl`),
-deduplicates by `(message.id, requestId)`, and measures the most recent
-assistant turn's prompt size against the 200 k-token limit.
-
 **Credit balance:** calls `GET https://platform.claude.com/api/organizations/{org}/prepaid/credits`
 with your platform.claude.com cookie — the same data shown on the Billing page.
 
@@ -184,7 +180,7 @@ the panel.
 
 | File | Purpose |
 |------|---------|
-| `plugins/claude-usage.30s.py` | SwiftBar plugin — fetches usage, reads transcripts, renders the panel |
+| `plugins/claude-usage.30s.py` | SwiftBar plugin — fetches usage and credit balance, renders the panel |
 | `icon_gen.py` | Regenerates the monster icon (Pillow) and re-embeds its base64 into the plugin |
 | `monster.png` / `monster.b64` | The generated menu-bar icon |
 

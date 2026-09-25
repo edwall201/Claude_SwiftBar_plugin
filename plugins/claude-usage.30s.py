@@ -2,7 +2,7 @@
 # <bitbar.title>Claude Usage</bitbar.title>
 # <bitbar.version>1.0</bitbar.version>
 # <bitbar.author>edward</bitbar.author>
-# <bitbar.desc>Shows local Claude Code token usage and computed cost.</bitbar.desc>
+# <bitbar.desc>Shows Claude 5-hour / weekly usage limits and API credit balance.</bitbar.desc>
 # <swiftbar.environment>[]</swiftbar.environment>
 # Hide SwiftBar's default footer. The "SwiftBar" item is a submenu, and macOS
 # reserves a disclosure-arrow gutter on the right of every row whenever any item
@@ -11,15 +11,14 @@
 # <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
 #
-# SwiftBar/xbar plugin. Reads Claude Code transcripts from ~/.claude/projects,
-# sums token usage per time window, and estimates USD cost from public pricing.
-# Note: this is *spend computed from local logs*, not an official balance.
+# SwiftBar/xbar plugin. Shows the official 5-hour and weekly usage limits from
+# claude.ai's usage endpoint, plus (optionally) the platform.claude.com prepaid
+# credit balance.
 
 import os
 import sys
 import io
 import json
-import glob
 import base64
 import subprocess
 from datetime import datetime, timezone, timedelta
@@ -29,8 +28,6 @@ try:
     HAVE_PIL = True
 except Exception:
     HAVE_PIL = False
-
-PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
 # The session / weekly numbers come from Anthropic's own usage endpoint — the
 # exact data behind Settings › Usage — authenticated with your claude.ai browser
@@ -53,6 +50,26 @@ USAGE_HEADERS = {
     "authority": "claude.ai",
 }
 
+# API prepaid credit balance — the "Credit balance" shown on
+# platform.claude.com → Settings › Billing. That's the developer/API console, a
+# *separate* login from claude.ai, so it has its own cookie file. The row only
+# appears when this cookie is set and the call succeeds (otherwise it's hidden,
+# like the Sonnet window when the API omits it).
+CONSOLE_COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_console_cookie")
+CREDIT_CACHE_FILE = os.path.expanduser("~/.claude/.usage_monitor_credit_cache.json")
+CREDITS_URL = "https://platform.claude.com/api/organizations/{org}/prepaid/credits"
+CONSOLE_HEADERS = {
+    "Accept": "*/*",
+    "Content-Type": "application/json",
+    "Origin": "https://platform.claude.com",
+    "Referer": "https://platform.claude.com/settings/billing",
+    "anthropic-client-platform": "web_console",
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36"),
+    "authority": "platform.claude.com",
+}
+
 # White pixel-art Claude-invader icon (regenerate with icon_gen.py).
 # Used with `templateImage=` so macOS tints it to the menu-bar label color.
 MONSTER_B64 = (
@@ -64,25 +81,6 @@ MONSTER_B64 = (
     "SSAkgZAEQhIISSAkgZCm7839dW/sv5/fcvT7zZ63cYOQBEISCEkgJIGQBEISCEkgJIGQBEISCEkg"
     "JIGQBEISCAAAp/MGmvQosug1gGcAAAAASUVORK5CYII="
 )
-
-# USD per 1M tokens. Cache write = input * 1.25 (5m) or * 2.0 (1h); cache read uses its own rate.
-PRICING = {
-    "opus":   {"in": 15.0, "out": 75.0, "cache_read": 1.50},
-    "sonnet": {"in": 3.0,  "out": 15.0, "cache_read": 0.30},
-    "haiku":  {"in": 1.0,  "out": 5.0,  "cache_read": 0.10},
-}
-DEFAULT = PRICING["sonnet"]
-
-
-def rates_for(model):
-    m = (model or "").lower()
-    if "opus" in m:
-        return PRICING["opus"]
-    if "haiku" in m:
-        return PRICING["haiku"]
-    if "sonnet" in m:
-        return PRICING["sonnet"]
-    return DEFAULT
 
 
 def parse_ts(s):
@@ -99,73 +97,122 @@ def parse_ts(s):
         return None
 
 
-def cost_for(usage, model):
-    r = rates_for(model)
-    inp = usage.get("input_tokens", 0) or 0
-    out = usage.get("output_tokens", 0) or 0
-    cread = usage.get("cache_read_input_tokens", 0) or 0
-    cc = usage.get("cache_creation") or {}
-    c5 = cc.get("ephemeral_5m_input_tokens", 0) or 0
-    c1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
-    if not (c5 or c1h):
-        # fall back to flat cache_creation_input_tokens treated as 5m write
-        c5 = usage.get("cache_creation_input_tokens", 0) or 0
-    cost = (
-        inp * r["in"]
-        + out * r["out"]
-        + cread * r["cache_read"]
-        + c5 * r["in"] * 1.25
-        + c1h * r["in"] * 2.0
-    ) / 1_000_000.0
-    tokens = inp + out + cread + c5 + c1h
-    ctx = inp + cread + c5 + c1h          # prompt size (≈ context window fill)
-    return cost, tokens, ctx
-
-
-def collect():
-    """Return (entries, latest) where latest=(ts, ctx_tokens, model) for the most
-    recent assistant turn (used to estimate the live context-window fill)."""
-    seen = set()
-    entries = []
-    latest = None
-    for path in glob.glob(os.path.join(PROJECTS_DIR, "**", "*.jsonl"), recursive=True):
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or '"usage"' not in line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-                    msg = d.get("message") or {}
-                    usage = msg.get("usage")
-                    if not usage:
-                        continue
-                    key = (msg.get("id"), d.get("requestId"))
-                    if key != (None, None) and key in seen:
-                        continue
-                    seen.add(key)
-                    ts = parse_ts(d.get("timestamp"))
-                    model = msg.get("model") or ""
-                    if "synthetic" in model.lower():
-                        continue
-                    cost, tokens, ctx = cost_for(usage, model)
-                    if tokens == 0:
-                        continue
-                    entries.append((ts, model, cost, tokens))
-                    if ts is not None and (latest is None or ts > latest[0]):
-                        latest = (ts, ctx, model)
-        except Exception:
-            continue
-    return entries, latest
-
-
 def pct_bar(frac, width=22):
     frac = max(0.0, min(1.0, frac))
     filled = int(round(frac * width))
     return "█" * filled + "░" * (width - filled)
+
+
+def _level_color(fr):
+    """Calm blue normally; warn orange/red as a limit fills up."""
+    if fr >= 0.85:
+        return (255, 69, 58)        # red
+    if fr >= 0.60:
+        return (255, 159, 10)       # orange
+    return (47, 98, 224)            # blue
+
+
+def _balance_color(fr):
+    """Credit-balance gauge runs the opposite way to a usage bar: full = healthy,
+    so it's green when there's plenty left and warns as it drains toward empty."""
+    if fr >= 0.50:
+        return (52, 199, 89)        # green
+    if fr >= 0.20:
+        return (255, 159, 10)       # orange
+    return (255, 69, 58)            # red
+
+
+def _hex(rgb):
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
+def is_dark_mode():
+    """True when macOS is in Dark mode (so the menu background is dark)."""
+    try:
+        out = subprocess.run(
+            ["defaults", "read", "-g", "AppleInterfaceStyle"],
+            capture_output=True, text=True, timeout=2)
+        return "dark" in (out.stdout or "").strip().lower()
+    except Exception:
+        return False
+
+
+def _load_font(size):
+    for p in ("/System/Library/Fonts/SFNS.ttf",
+              "/System/Library/Fonts/SFNSDisplay.ttf",
+              "/System/Library/Fonts/Helvetica.ttc",
+              "/System/Library/Fonts/Supplemental/Arial.ttf"):
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def render_panel(rows):
+    """Render the whole usage panel as one crisp base64 PNG. An image menu item
+    keeps full color (macOS doesn't dim it like grey text) and isn't a row of
+    clickable buttons. Returns a base64 string, or None on any failure."""
+    try:
+        S = 2                       # supersample, paired with 144 DPI => retina
+        W = 300                     # logical width. With the submenu footer hidden
+        #                             (see header) the panel is the widest row, so
+        #                             W sets the menu width directly — no reserved
+        #                             arrow gutter to leave blank space on the right.
+        pad = 8                     # left+right inner margin (smaller => content
+        #                             hugs both edges of the panel more tightly)
+        row_h = 42
+        div_gap = 12
+        top = 12
+        bot = 10
+        n = len(rows)
+        ndiv = sum(1 for r in rows if r.get("divider"))
+        H = top + row_h * n + div_gap * ndiv + bot
+
+        dark = is_dark_mode()
+        text_col = (245, 245, 247) if dark else (29, 29, 31)
+        sub_col = (152, 152, 160) if dark else (120, 120, 128)
+        track_col = (74, 74, 78) if dark else (224, 224, 230)
+        div_col = (255, 255, 255, 28) if dark else (0, 0, 0, 24)
+
+        img = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        f_label = _load_font(14 * S)
+        f_value = _load_font(12 * S)
+
+        y = top * S
+        inner = (W - 2 * pad) * S
+        for r in rows:
+            if r.get("divider"):
+                y += div_gap * S
+                ly = y - (div_gap // 2) * S
+                d.line([(pad * S, ly), ((W - pad) * S, ly)],
+                       fill=div_col, width=max(1, S))
+            d.text((pad * S, y), r["label"], font=f_label, fill=text_col)
+            vw = d.textlength(r["value"], font=f_value)
+            d.text((W * S - pad * S - vw, y + 3 * S), r["value"],
+                   font=f_value, fill=sub_col)
+            by = y + 24 * S
+            bh = 8 * S
+            rad = bh / 2.0
+            d.rounded_rectangle([pad * S, by, pad * S + inner, by + bh],
+                                radius=rad, fill=track_col)
+            fr = max(0.0, min(1.0, r["frac"]))
+            if fr > 0:
+                fw = max(bh, inner * fr)
+                bar_col = (_balance_color(fr) if r.get("kind") == "balance"
+                           else _level_color(fr))
+                d.rounded_rectangle([pad * S, by, pad * S + fw, by + bh],
+                                    radius=rad, fill=bar_col)
+            y += row_h * S
+
+        buf = io.BytesIO()
+        dpi = 72 * S
+        img.save(buf, format="PNG", dpi=(dpi, dpi))
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
 
 
 def fmt_hm(delta):
@@ -208,6 +255,32 @@ def clear_cookie():
         pass
 
 
+def read_console_cookie():
+    """Return the saved platform.claude.com cookie string, or '' if unset."""
+    try:
+        with open(CONSOLE_COOKIE_FILE) as fh:
+            return fh.read().strip()
+    except Exception:
+        return ""
+
+
+def save_console_cookie(cookie):
+    try:
+        os.makedirs(os.path.dirname(CONSOLE_COOKIE_FILE), exist_ok=True)
+        with open(CONSOLE_COOKIE_FILE, "w") as fh:
+            fh.write(cookie.strip())
+        os.chmod(CONSOLE_COOKIE_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def clear_console_cookie():
+    try:
+        os.remove(CONSOLE_COOKIE_FILE)
+    except Exception:
+        pass
+
+
 def org_id_from_cookie(cookie):
     """The cookie usually carries lastActiveOrg=<uuid>; pull it straight out."""
     for part in cookie.split(";"):
@@ -224,7 +297,7 @@ class _HttpError(Exception):
         self.code = code
 
 
-def _get_json(url, cookie, timeout=8):
+def _get_json(url, cookie, timeout=8, headers=None):
     """GET a claude.ai JSON endpoint through the system curl. curl uses macOS's own
     trust store, so this works regardless of how the Python install's CA bundle is
     configured (the stock python.org build often has none) — the same networking
@@ -237,7 +310,7 @@ def _get_json(url, cookie, timeout=8):
     args = ["/usr/bin/curl", "--silent", "--show-error", "--http1.1",
             "--max-time", str(timeout),
             "-H", "Cookie: " + cookie, "-w", "\n%{http_code}"]
-    for k, v in USAGE_HEADERS.items():
+    for k, v in (headers or USAGE_HEADERS).items():
         args += ["-H", "{}: {}".format(k, v)]
     args.append(url)
     out = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 5)
@@ -293,18 +366,35 @@ def usage_window(data, key):
     return fr, parse_ts(w.get("resets_at"))
 
 
-def load_cache():
+def fetch_credits():
+    """API prepaid credit balance from platform.claude.com (the console billing
+    page). Best-effort: returns the raw dict ({'amount': cents, 'currency': ...,
+    'last_paid_purchase_cents': ...}) or None when there's no console cookie or
+    the call fails. Uses its own cookie (a different login from claude.ai)."""
+    cookie = read_console_cookie()
+    if not cookie:
+        return None
+    org = org_id_from_cookie(cookie)
+    if not org:
+        return None
     try:
-        with open(CACHE_FILE) as fh:
+        return _get_json(CREDITS_URL.format(org=org), cookie, headers=CONSOLE_HEADERS)
+    except Exception:
+        return None
+
+
+def load_cache(path=CACHE_FILE):
+    try:
+        with open(path) as fh:
             return json.load(fh)
     except Exception:
         return None
 
 
-def save_cache(data):
+def save_cache(data, path=CACHE_FILE):
     try:
-        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-        with open(CACHE_FILE, "w") as fh:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
             json.dump(data, fh)
     except Exception:
         pass
@@ -330,118 +420,32 @@ def prompt_cookie():
         pass
 
 
-def is_dark_mode():
-    """True when macOS is in Dark mode (so the menu background is dark)."""
+def prompt_console_cookie():
+    """Pop a native dialog to paste the platform.claude.com cookie (the API
+    console — separate login from claude.ai), then save it privately."""
+    msg = ("Paste your platform.claude.com cookie.\\n\\n"
+           "platform.claude.com → Settings → Billing, open DevTools (⌥⌘I) → "
+           "Network, refresh, click the 'credits' request, then copy the whole "
+           "'Cookie' value from its Request Headers.")
+    osa = ('set t to text returned of (display dialog "{}" default answer "" '
+           'with title "Claude Usage — set credit-balance cookie" '
+           'buttons {{"Cancel", "Save"}} default button "Save")').format(msg)
     try:
-        out = subprocess.run(
-            ["defaults", "read", "-g", "AppleInterfaceStyle"],
-            capture_output=True, text=True, timeout=2)
-        return "dark" in (out.stdout or "").strip().lower()
+        out = subprocess.run(["osascript", "-e", osa],
+                             capture_output=True, text=True, timeout=180)
+        cookie = (out.stdout or "").strip()
+        if cookie:
+            save_console_cookie(cookie)
     except Exception:
-        return False
-
-
-def _load_font(size):
-    for p in ("/System/Library/Fonts/SFNS.ttf",
-              "/System/Library/Fonts/SFNSDisplay.ttf",
-              "/System/Library/Fonts/Helvetica.ttc",
-              "/System/Library/Fonts/Supplemental/Arial.ttf"):
-        if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
-
-
-def _level_color(fr):
-    """Calm blue normally; warn orange/red as a limit fills up."""
-    if fr >= 0.85:
-        return (255, 69, 58)        # red
-    if fr >= 0.60:
-        return (255, 159, 10)       # orange
-    return (47, 98, 224)            # blue
-
-
-def render_panel(rows):
-    """Render the whole usage panel as one crisp base64 PNG. An image menu item
-    keeps full color (macOS doesn't dim it like grey text) and isn't a row of
-    clickable buttons. Returns a base64 string, or None on any failure."""
-    try:
-        S = 2                       # supersample, paired with 144 DPI => retina
-        W = 300                     # logical width. With the submenu footer hidden
-        #                             (see header) the panel is the widest row, so
-        #                             W sets the menu width directly — no reserved
-        #                             arrow gutter to leave blank space on the right.
-        pad = 8                     # left+right inner margin (smaller => content
-        #                             hugs both edges of the panel more tightly)
-        row_h = 42
-        div_gap = 12
-        top = 12
-        bot = 10
-        n = len(rows)
-        ndiv = sum(1 for r in rows if r.get("divider"))
-        H = top + row_h * n + div_gap * ndiv + bot
-
-        dark = is_dark_mode()
-        text_col = (245, 245, 247) if dark else (29, 29, 31)
-        sub_col = (152, 152, 160) if dark else (120, 120, 128)
-        track_col = (74, 74, 78) if dark else (224, 224, 230)
-        div_col = (255, 255, 255, 28) if dark else (0, 0, 0, 24)
-
-        img = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        f_label = _load_font(14 * S)
-        f_value = _load_font(12 * S)
-
-        y = top * S
-        inner = (W - 2 * pad) * S
-        for r in rows:
-            if r.get("divider"):
-                y += div_gap * S
-                ly = y - (div_gap // 2) * S
-                d.line([(pad * S, ly), ((W - pad) * S, ly)],
-                       fill=div_col, width=max(1, S))
-            d.text((pad * S, y), r["label"], font=f_label, fill=text_col)
-            vw = d.textlength(r["value"], font=f_value)
-            d.text((W * S - pad * S - vw, y + 3 * S), r["value"],
-                   font=f_value, fill=sub_col)
-            by = y + 24 * S
-            bh = 8 * S
-            rad = bh / 2.0
-            d.rounded_rectangle([pad * S, by, pad * S + inner, by + bh],
-                                radius=rad, fill=track_col)
-            fr = max(0.0, min(1.0, r["frac"]))
-            if fr > 0:
-                fw = max(bh, inner * fr)
-                d.rounded_rectangle([pad * S, by, pad * S + fw, by + bh],
-                                    radius=rad, fill=_level_color(fr))
-            y += row_h * S
-
-        buf = io.BytesIO()
-        dpi = 72 * S
-        img.save(buf, format="PNG", dpi=(dpi, dpi))
-        return base64.b64encode(buf.getvalue()).decode()
-    except Exception:
-        return None
+        pass
 
 
 def main():
-    _, latest = collect()
     now = datetime.now(timezone.utc).astimezone()
-    BLUE = "#2F62E0"          # solid bar color
     INK = "#000000"          # solid dropdown text
     TXT = "Menlo-Bold"       # bold so vibrancy doesn't wash it to grey
     BAR_W = 40
     script = os.path.abspath(__file__)
-
-    # Context window (latest assistant turn) — the one figure the official API
-    # doesn't expose, so we still derive it from the local transcripts.
-    ctx_max = 200_000
-    ctx_tok = latest[1] if latest else 0
-    ctx_frac = ctx_tok / ctx_max
-    ctx_value = "{:.1f}k / {:.0f}k · {:.0f}%".format(
-        ctx_tok / 1000, ctx_max / 1000, ctx_frac * 100)
 
     # Session + weekly: the real numbers straight from Anthropic's usage endpoint.
     cookie = read_cookie()
@@ -460,9 +464,8 @@ def main():
     # Build rows. The dropdown is rendered as one image so the text stays crisp
     # and dark (macOS dims grey *text* items, and making them clickable turns
     # every line into a highlightable button); an image is neither.
-    rows = [{"label": "Context window", "value": ctx_value,
-             "frac": ctx_frac, "divider": False}]
-    for key, label, div in (("five_hour", "5-hour limit", True),
+    rows = []
+    for key, label, div in (("five_hour", "5-hour limit", False),
                             ("seven_day", "Weekly · all models", False),
                             ("seven_day_sonnet", "Weekly · Sonnet", False)):
         w = usage_window(data, key)
@@ -475,16 +478,44 @@ def main():
             value = "{:.0f}%".format(fr * 100)
         rows.append({"label": label, "value": value, "frac": fr, "divider": div})
 
+    # API prepaid credit balance (platform.claude.com console). Separate login, so
+    # this is best-effort: the row only shows when that cookie is set and the call
+    # works. Cached like the usage data so a blip doesn't drop it.
+    credit = fetch_credits()
+    if credit is not None:
+        save_cache(credit, CREDIT_CACHE_FILE)
+    else:
+        credit = load_cache(CREDIT_CACHE_FILE)
+    if isinstance(credit, dict) and isinstance(credit.get("amount"), (int, float)):
+        cents = credit["amount"]
+        cur = credit.get("currency") or "USD"
+        sym = "$" if cur == "USD" else cur + " "
+        ref = credit.get("last_paid_purchase_cents") or 0
+        if ref < cents:                       # no/old top-up reference => full gauge
+            ref = cents
+        frac = (cents / ref) if ref else 0.0
+        rows.append({"label": "Credit balance",
+                     "value": "{}{:.2f}".format(sym, cents / 100.0),
+                     "frac": frac, "divider": True, "kind": "balance"})
+
     panel = render_panel(rows) if HAVE_PIL else None
     if panel:
         print("| image={}".format(panel))
     else:
-        # Fallback (no PIL): plain text rows, no refresh=true so they aren't buttons.
-        for r in rows:
+        # Fallback (no PIL, or the image failed to render): plain text rows
+        # with the same color-coded bars and section dividers.
+        for i, r in enumerate(rows):
+            if r.get("divider") and i > 0:
+                print("---")
+            bar_color = _hex(_balance_color(r["frac"]) if r.get("kind") == "balance" else _level_color(r["frac"]))
             print("{}  {} | font={} color={}".format(r["label"], r["value"], TXT, INK))
-            print("{} | font=Menlo color={}".format(pct_bar(r["frac"], BAR_W), BLUE))
+            print("{} | font=Menlo color={}".format(pct_bar(r["frac"], BAR_W), bar_color))
 
-    # Status line + cookie actions.
+    # Status line + cookie actions. SwiftBar incrementally diffs menu items on
+    # refresh, and a big image= item next to a *varying* item count above/below
+    # it desyncs that diff (https://github.com/swiftbar/SwiftBar/issues/482),
+    # corrupting the rendered panel. So every branch below prints a fixed
+    # number of lines each cycle — only the label/color changes with state.
     print("---")
     if data is None:
         hint = {
@@ -496,12 +527,16 @@ def main():
         print("⚠ {} | color=#cc6600".format(hint))
     elif stale:
         print("⚠ showing last good data (couldn't refresh) | color=#999999 size=11")
-
-    if cookie:
-        print("Update cookie… | bash=\"{}\" param1=--set-cookie terminal=false refresh=true".format(script))
-        print("Clear cookie | bash=\"{}\" param1=--clear-cookie terminal=false refresh=true".format(script))
     else:
-        print("Set claude.ai cookie… | bash=\"{}\" param1=--set-cookie terminal=false refresh=true".format(script))
+        print("✓ Live | color=#999999 size=11")
+
+    label = "Update cookie…" if cookie else "Set claude.ai cookie…"
+    print("{} | bash=\"{}\" param1=--set-cookie terminal=false refresh=true".format(label, script))
+    print("Clear cookie | bash=\"{}\" param1=--clear-cookie terminal=false refresh=true".format(script))
+
+    label = "Update credit-balance cookie…" if read_console_cookie() else "Set credit-balance cookie…"
+    print("{} | bash=\"{}\" param1=--set-console-cookie terminal=false refresh=true".format(label, script))
+    print("Clear credit-balance cookie | bash=\"{}\" param1=--clear-console-cookie terminal=false refresh=true".format(script))
     print("Refresh | refresh=true")
 
 
@@ -511,5 +546,9 @@ if __name__ == "__main__":
         prompt_cookie()
     elif arg == "--clear-cookie":
         clear_cookie()
+    elif arg == "--set-console-cookie":
+        prompt_console_cookie()
+    elif arg == "--clear-console-cookie":
+        clear_console_cookie()
     else:
         main()
