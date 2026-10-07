@@ -2,7 +2,7 @@
 # <bitbar.title>Claude Usage</bitbar.title>
 # <bitbar.version>1.0</bitbar.version>
 # <bitbar.author>edward</bitbar.author>
-# <bitbar.desc>Shows Claude 5-hour / weekly usage limits, API credit balance, and Meta Muse usage.</bitbar.desc>
+# <bitbar.desc>Shows Claude 5-hour / weekly usage limits, API credit balance, Meta Muse, and ChatGPT usage.</bitbar.desc>
 # <swiftbar.environment>[]</swiftbar.environment>
 # Hide SwiftBar's default footer. The "SwiftBar" item is a submenu, and macOS
 # reserves a disclosure-arrow gutter on the right of every row whenever any item
@@ -13,7 +13,8 @@
 #
 # SwiftBar/xbar plugin. Shows the official 5-hour and weekly usage limits from
 # claude.ai's usage endpoint, plus (optionally) the platform.claude.com prepaid
-# credit balance and Meta Muse (muse.ai) weekly usage / extra tokens.
+# credit balance, Meta Muse (muse.ai) weekly usage / extra tokens, and ChatGPT
+# usage limits.
 
 import os
 import sys
@@ -91,6 +92,23 @@ MUSE_HEADERS = {
     "Sec-Fetch-Site": "same-origin",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Dest": "empty",
+    "User-Agent": USAGE_HEADERS["User-Agent"],
+}
+
+# ChatGPT usage — the numbers behind chatgpt.com Settings › Usage. The cookie
+# alone can't call backend-api: /api/auth/session trades it for a short-lived
+# bearer token first (the same thing the web app does on load). Like claude.ai,
+# Cloudflare only lets curl through over HTTP/1.1.
+CHATGPT_COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_chatgpt_cookie")
+CHATGPT_CACHE_FILE = os.path.expanduser("~/.claude/.usage_monitor_chatgpt_cache.json")
+CHATGPT_SESSION_URL = "https://chatgpt.com/api/auth/session"
+CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CHATGPT_MONTHLY_URL = ("https://chatgpt.com/backend-api/accounts/{acct}/spend-controls/"
+                       "current-user/monthly-usage?supports_usage_limit_modes=true")
+CHATGPT_HEADERS = {
+    "Accept": "*/*",
+    "Origin": "https://chatgpt.com",
+    "Referer": "https://chatgpt.com/settings/usage",
     "User-Agent": USAGE_HEADERS["User-Agent"],
 }
 
@@ -446,6 +464,32 @@ def fetch_muse():
     return None
 
 
+def fetch_chatgpt():
+    """ChatGPT usage limits. Returns {'usage': wham/usage dict (rate_limit with
+    primary/secondary windows), 'monthly': monthly credit usage dict or None},
+    or None when there's no cookie or the session/usage call fails."""
+    cookie = read_file_cookie(CHATGPT_COOKIE_FILE)
+    if not cookie:
+        return None
+    try:
+        sess = _get_json(CHATGPT_SESSION_URL, cookie, headers=CHATGPT_HEADERS)
+        token = sess.get("accessToken")
+        if not token:
+            return None                  # cookie expired: session comes back empty
+        auth = dict(CHATGPT_HEADERS, Authorization="Bearer " + token)
+        usage = _get_json(CHATGPT_USAGE_URL, cookie, headers=auth)
+    except Exception:
+        return None
+    monthly = None
+    acct = (sess.get("account") or {}).get("id")
+    if acct:
+        try:
+            monthly = _get_json(CHATGPT_MONTHLY_URL.format(acct=acct), cookie, headers=auth)
+        except Exception:
+            pass
+    return {"usage": usage, "monthly": monthly}
+
+
 def load_cache(path=CACHE_FILE):
     try:
         with open(path) as fh:
@@ -521,6 +565,28 @@ def prompt_muse_cookie():
             with open(MUSE_COOKIE_FILE, "w") as fh:
                 fh.write(cookie)
             os.chmod(MUSE_COOKIE_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def prompt_chatgpt_cookie():
+    """Pop a native dialog to paste the chatgpt.com cookie, then save it privately."""
+    msg = ("Paste your chatgpt.com cookie.\\n\\n"
+           "chatgpt.com → Settings → Usage, open DevTools (⌥⌘I) → Network, "
+           "refresh, click the 'usage' request, then copy the whole 'Cookie' "
+           "value from its Request Headers.")
+    osa = ('set t to text returned of (display dialog "{}" default answer "" '
+           'with title "Claude Usage — set ChatGPT cookie" '
+           'buttons {{"Cancel", "Save"}} default button "Save")').format(msg)
+    try:
+        out = subprocess.run(["osascript", "-e", osa],
+                             capture_output=True, text=True, timeout=180)
+        cookie = (out.stdout or "").strip()
+        if cookie:
+            os.makedirs(os.path.dirname(CHATGPT_COOKIE_FILE), exist_ok=True)
+            with open(CHATGPT_COOKIE_FILE, "w") as fh:
+                fh.write(cookie)
+            os.chmod(CHATGPT_COOKIE_FILE, 0o600)
     except Exception:
         pass
 
@@ -612,6 +678,40 @@ def main():
                          "value": m.group(1) if m else "{:.0f}% left".format(bal / tot * 100),
                          "frac": bal / tot, "divider": False, "kind": "balance"})
 
+    # ChatGPT: rolling usage windows (weekly on every plan; Plus/Pro also get a
+    # 5-hour one) plus the monthly credit cap when the account has one set.
+    gpt = fetch_chatgpt()
+    if gpt is not None:
+        save_cache(gpt, CHATGPT_CACHE_FILE)
+    elif read_file_cookie(CHATGPT_COOKIE_FILE):
+        gpt = load_cache(CHATGPT_CACHE_FILE)
+    if isinstance(gpt, dict):
+        first = True
+        rl = (gpt.get("usage") or {}).get("rate_limit") or {}
+        for key in ("primary_window", "secondary_window"):
+            w = rl.get(key)
+            if not isinstance(w, dict) or not isinstance(w.get("used_percent"), (int, float)):
+                continue
+            secs = w.get("limit_window_seconds") or 0
+            span = {18000: "5-hour", 604800: "weekly"}.get(secs, "{}h".format(secs // 3600))
+            pct = w["used_percent"]
+            value = "{:.0f}%".format(pct)
+            ra = w.get("reset_at")
+            if isinstance(ra, (int, float)):
+                reset = datetime.fromtimestamp(ra, timezone.utc).astimezone()
+                if reset > now:
+                    value += " · resets {}".format(fmt_hm(reset - now))
+            rows.append({"label": "ChatGPT · " + span, "value": value,
+                         "frac": pct / 100.0, "divider": first})
+            first = False
+        mo = gpt.get("monthly") or {}
+        cap = (mo.get("effective_monthly_limit") or {}).get("limit")
+        used = mo.get("current_month_usage")
+        if isinstance(cap, (int, float)) and cap > 0 and isinstance(used, (int, float)):
+            rows.append({"label": "ChatGPT · monthly credits",
+                         "value": "{:g} of {:g} used".format(used, cap),
+                         "frac": used / cap, "divider": first})
+
     panel = render_panel(rows) if HAVE_PIL else None
     if panel:
         print("| image={}".format(panel))
@@ -654,6 +754,9 @@ def main():
     label = "Update Muse cookie…" if read_file_cookie(MUSE_COOKIE_FILE) else "Set Muse cookie…"
     print("{} | bash=\"{}\" param1=--set-muse-cookie terminal=false refresh=true".format(label, script))
     print("Clear Muse cookie | bash=\"{}\" param1=--clear-muse-cookie terminal=false refresh=true".format(script))
+    label = "Update ChatGPT cookie…" if read_file_cookie(CHATGPT_COOKIE_FILE) else "Set ChatGPT cookie…"
+    print("{} | bash=\"{}\" param1=--set-chatgpt-cookie terminal=false refresh=true".format(label, script))
+    print("Clear ChatGPT cookie | bash=\"{}\" param1=--clear-chatgpt-cookie terminal=false refresh=true".format(script))
     print("Refresh | refresh=true")
 
 
@@ -672,6 +775,13 @@ if __name__ == "__main__":
     elif arg == "--clear-muse-cookie":
         try:
             os.remove(MUSE_COOKIE_FILE)
+        except Exception:
+            pass
+    elif arg == "--set-chatgpt-cookie":
+        prompt_chatgpt_cookie()
+    elif arg == "--clear-chatgpt-cookie":
+        try:
+            os.remove(CHATGPT_COOKIE_FILE)
         except Exception:
             pass
     else:
