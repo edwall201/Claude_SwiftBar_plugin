@@ -2,7 +2,7 @@
 # <bitbar.title>Claude Usage</bitbar.title>
 # <bitbar.version>1.0</bitbar.version>
 # <bitbar.author>edward</bitbar.author>
-# <bitbar.desc>Shows Claude 5-hour / weekly usage limits and API credit balance.</bitbar.desc>
+# <bitbar.desc>Shows Claude 5-hour / weekly usage limits, API credit balance, and Meta Muse usage.</bitbar.desc>
 # <swiftbar.environment>[]</swiftbar.environment>
 # Hide SwiftBar's default footer. The "SwiftBar" item is a submenu, and macOS
 # reserves a disclosure-arrow gutter on the right of every row whenever any item
@@ -13,12 +13,13 @@
 #
 # SwiftBar/xbar plugin. Shows the official 5-hour and weekly usage limits from
 # claude.ai's usage endpoint, plus (optionally) the platform.claude.com prepaid
-# credit balance.
+# credit balance and Meta Muse (muse.ai) weekly usage / extra tokens.
 
 import os
 import sys
 import io
 import json
+import re
 import base64
 import subprocess
 from datetime import datetime, timezone, timedelta
@@ -68,6 +69,29 @@ CONSOLE_HEADERS = {
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/120.0.0.0 Safari/537.36"),
     "authority": "platform.claude.com",
+}
+
+# Meta Muse (muse.ai) usage — the numbers behind its Settings › General › Usage
+# panel. Muse is a Next.js app with no REST usage endpoint: the panel calls a
+# server action (POST / with a `Next-Action` header). That action id is a build
+# hash, so it may change when Muse redeploys; if the row turns into an error,
+# re-capture it from DevTools (the POST to / whose response has "percentUsed").
+MUSE_COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_cookie")
+MUSE_CACHE_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_cache.json")
+MUSE_URL = "https://muse.ai/"
+MUSE_ACTION_ID = "409a453bab86cadab1629915e1baf2d9c1701284be"
+MUSE_HEADERS = {
+    "Accept": "text/x-component",
+    "Content-Type": "text/plain;charset=UTF-8",
+    "Next-Action": MUSE_ACTION_ID,
+    "Origin": "https://muse.ai",
+    "Referer": "https://muse.ai/",
+    # Muse's middleware 403s requests without the fetch-metadata headers a
+    # browser sends on a same-origin fetch, even with a valid session cookie.
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "User-Agent": USAGE_HEADERS["User-Agent"],
 }
 
 # White pixel-art Claude-invader icon (regenerate with icon_gen.py).
@@ -281,6 +305,14 @@ def clear_console_cookie():
         pass
 
 
+def read_file_cookie(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except Exception:
+        return ""
+
+
 def org_id_from_cookie(cookie):
     """The cookie usually carries lastActiveOrg=<uuid>; pull it straight out."""
     for part in cookie.split(";"):
@@ -383,6 +415,37 @@ def fetch_credits():
         return None
 
 
+def fetch_muse():
+    """Muse subscription/usage via its settings server action. Returns the
+    `subscription` dict (usage.percentUsed, usage.resetsAt epoch secs,
+    topupBalance, topupTotal, ...) or None when there's no cookie or it fails."""
+    cookie = read_file_cookie(MUSE_COOKIE_FILE)
+    if not cookie:
+        return None
+    args = ["/usr/bin/curl", "--silent", "--show-error", "--http1.1",
+            "--max-time", "8", "-X", "POST",
+            "-H", "Cookie: " + cookie, "--data", '[{"includeAgreement":true}]']
+    for k, v in MUSE_HEADERS.items():
+        args += ["-H", "{}: {}".format(k, v)]
+    args.append(MUSE_URL)
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=13)
+    except Exception:
+        return None
+    # React Server Components stream: one "<id>:<json>" record per line; the
+    # action's return value is the record holding "subscription".
+    for line in (out.stdout or "").splitlines():
+        _, _, payload = line.partition(":")
+        if '"subscription"' not in payload:
+            continue
+        try:
+            sub = json.loads(payload).get("subscription")
+        except Exception:
+            return None
+        return sub if isinstance(sub, dict) else None
+    return None
+
+
 def load_cache(path=CACHE_FILE):
     try:
         with open(path) as fh:
@@ -436,6 +499,28 @@ def prompt_console_cookie():
         cookie = (out.stdout or "").strip()
         if cookie:
             save_console_cookie(cookie)
+    except Exception:
+        pass
+
+
+def prompt_muse_cookie():
+    """Pop a native dialog to paste the muse.ai cookie, then save it privately."""
+    msg = ("Paste your muse.ai cookie.\\n\\n"
+           "muse.ai → open DevTools (⌥⌘I) → Network, open Settings, click the "
+           "POST request to muse.ai/ (its response has percentUsed), then copy "
+           "the whole 'Cookie' value from its Request Headers.")
+    osa = ('set t to text returned of (display dialog "{}" default answer "" '
+           'with title "Claude Usage — set Muse cookie" '
+           'buttons {{"Cancel", "Save"}} default button "Save")').format(msg)
+    try:
+        out = subprocess.run(["osascript", "-e", osa],
+                             capture_output=True, text=True, timeout=180)
+        cookie = (out.stdout or "").strip()
+        if cookie:
+            os.makedirs(os.path.dirname(MUSE_COOKIE_FILE), exist_ok=True)
+            with open(MUSE_COOKIE_FILE, "w") as fh:
+                fh.write(cookie)
+            os.chmod(MUSE_COOKIE_FILE, 0o600)
     except Exception:
         pass
 
@@ -498,6 +583,35 @@ def main():
                      "value": "{}{:.2f}".format(sym, cents / 100.0),
                      "frac": frac, "divider": True, "kind": "balance"})
 
+    # Meta Muse: weekly plan usage + prepaid top-up tokens. Best-effort like the
+    # credit balance — hidden until a muse.ai cookie is set.
+    muse = fetch_muse()
+    if muse is not None:
+        save_cache(muse, MUSE_CACHE_FILE)
+    elif read_file_cookie(MUSE_COOKIE_FILE):
+        muse = load_cache(MUSE_CACHE_FILE)
+    if isinstance(muse, dict):
+        u = muse.get("usage") or {}
+        pct = u.get("percentUsed")
+        if isinstance(pct, (int, float)):
+            fr = pct / 100.0
+            value = "{:.0f}%".format(pct)
+            ra = u.get("resetsAt")
+            if isinstance(ra, (int, float)):
+                reset = datetime.fromtimestamp(ra, timezone.utc).astimezone()
+                if reset > now:
+                    value += " · resets {}".format(fmt_hm(reset - now))
+            rows.append({"label": "Muse · weekly", "value": value,
+                         "frac": fr, "divider": True})
+        bal, tot = muse.get("topupBalance"), muse.get("topupTotal")
+        if isinstance(bal, (int, float)) and isinstance(tot, (int, float)) and tot > 0:
+            # topupBalance isn't in tokens (240M total shows as ~6B tokens on the
+            # site), so take the "5.9B tokens left" text from Muse's own label.
+            m = re.search(r"\(([^)]*left)\)", muse.get("topupRowValueLabel") or "")
+            rows.append({"label": "Muse · extra tokens",
+                         "value": m.group(1) if m else "{:.0f}% left".format(bal / tot * 100),
+                         "frac": bal / tot, "divider": False, "kind": "balance"})
+
     panel = render_panel(rows) if HAVE_PIL else None
     if panel:
         print("| image={}".format(panel))
@@ -537,6 +651,9 @@ def main():
     label = "Update credit-balance cookie…" if read_console_cookie() else "Set credit-balance cookie…"
     print("{} | bash=\"{}\" param1=--set-console-cookie terminal=false refresh=true".format(label, script))
     print("Clear credit-balance cookie | bash=\"{}\" param1=--clear-console-cookie terminal=false refresh=true".format(script))
+    label = "Update Muse cookie…" if read_file_cookie(MUSE_COOKIE_FILE) else "Set Muse cookie…"
+    print("{} | bash=\"{}\" param1=--set-muse-cookie terminal=false refresh=true".format(label, script))
+    print("Clear Muse cookie | bash=\"{}\" param1=--clear-muse-cookie terminal=false refresh=true".format(script))
     print("Refresh | refresh=true")
 
 
@@ -550,5 +667,12 @@ if __name__ == "__main__":
         prompt_console_cookie()
     elif arg == "--clear-console-cookie":
         clear_console_cookie()
+    elif arg == "--set-muse-cookie":
+        prompt_muse_cookie()
+    elif arg == "--clear-muse-cookie":
+        try:
+            os.remove(MUSE_COOKIE_FILE)
+        except Exception:
+            pass
     else:
         main()
