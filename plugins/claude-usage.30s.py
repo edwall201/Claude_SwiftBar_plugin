@@ -486,21 +486,27 @@ def fetch_muse():
 
 
 def fetch_chatgpt():
-    """ChatGPT usage limits. Returns {'usage': wham/usage dict (rate_limit with
-    primary/secondary windows), 'monthly': monthly credit usage dict or None},
-    or None when there's no cookie or the session/usage call fails."""
+    """ChatGPT usage limits. Returns (data, err): data is {'usage': wham/usage
+    dict (rate_limit with primary/secondary windows), 'monthly': monthly credit
+    usage dict or None} or None; err is a short tag — 'nocookie', 'auth' (cookie
+    expired), 'net', or 'httpNNN'."""
     cookie = read_file_cookie(CHATGPT_COOKIE_FILE)
     if not cookie:
-        return None
+        return None, "nocookie"
     try:
         sess = _get_json(CHATGPT_SESSION_URL, cookie, headers=CHATGPT_HEADERS)
         token = sess.get("accessToken")
-        if not token:
-            return None                  # cookie expired: session comes back empty
+        # An expired cookie either comes back empty or, once its embedded access
+        # token lapses (~10 days) and the refresh token has been rotated by the
+        # browser, still hands back that dead token alongside this error.
+        if not token or sess.get("error") == "RefreshAccessTokenError":
+            return None, "auth"
         auth = dict(CHATGPT_HEADERS, Authorization="Bearer " + token)
         usage = _get_json(CHATGPT_USAGE_URL, cookie, headers=auth)
+    except _HttpError as e:
+        return None, "auth" if e.code in (401, 403) else "http{}".format(e.code)
     except Exception:
-        return None
+        return None, "net"
     monthly = None
     acct = (sess.get("account") or {}).get("id")
     if acct:
@@ -508,7 +514,7 @@ def fetch_chatgpt():
             monthly = _get_json(CHATGPT_MONTHLY_URL.format(acct=acct), cookie, headers=auth)
         except Exception:
             pass
-    return {"usage": usage, "monthly": monthly}
+    return {"usage": usage, "monthly": monthly}, None
 
 
 def load_cache(path=CACHE_FILE):
@@ -732,11 +738,25 @@ def main():
 
     # ChatGPT: rolling usage windows (weekly on every plan; Plus/Pro also get a
     # 5-hour one) plus the monthly credit cap when the account has one set.
-    gpt = fetch_chatgpt()
+    # Same cache rule as Muse: only a network blip, and only while none of the
+    # cached windows has reset since.
+    gpt, gpt_err = fetch_chatgpt()
     if gpt is not None:
         save_cache(gpt, CHATGPT_CACHE_FILE)
-    elif read_file_cookie(CHATGPT_COOKIE_FILE):
+    elif gpt_err == "net":
         gpt = load_cache(CHATGPT_CACHE_FILE)
+        rl = (((gpt.get("usage") or {}).get("rate_limit") or {})
+              if isinstance(gpt, dict) else {})
+        resets = [w.get("reset_at") for w in (rl.get("primary_window"), rl.get("secondary_window"))
+                  if isinstance(w, dict)]
+        if not resets or not all(isinstance(r, (int, float)) and r > now.timestamp()
+                                 for r in resets):
+            gpt = None
+    if gpt is None and gpt_err != "nocookie":
+        hint = {"auth": "cookie expired · re-set it",
+                "net": "couldn't reach chatgpt.com"}.get(gpt_err, "couldn't load ({})".format(gpt_err))
+        rows.append({"label": "ChatGPT · weekly", "value": hint,
+                     "frac": 0.0, "divider": True})
     if isinstance(gpt, dict):
         first = True
         rl = (gpt.get("usage") or {}).get("rate_limit") or {}
