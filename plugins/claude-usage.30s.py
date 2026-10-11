@@ -83,7 +83,7 @@ MUSE_COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_cookie")
 MUSE_ACTION_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_action")
 MUSE_CACHE_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_cache.json")
 MUSE_URL = "https://muse.ai/"
-MUSE_ACTION_ID = "409a453bab86cadab1629915e1baf2d9c1701284be"
+MUSE_ACTION_ID = "4050123b51ffb1f6f8072de6bc4f525b54e7c950e7"   # fetchSubscriptionAction
 MUSE_HEADERS = {
     "Accept": "text/x-component",
     "Content-Type": "text/plain;charset=UTF-8",
@@ -244,7 +244,10 @@ def render_panel(rows):
                                 radius=rad, fill=track_col)
             fr = max(0.0, min(1.0, r["frac"]))
             if fr > 0:
-                fw = max(bh, inner * fr)
+                # Pillow ≤10 raises on a rounded rect only 2*radius wide (it
+                # draws the middle strip with x1 < x0), which killed the whole
+                # panel for a ~1-3% row; keep the minimum pill just wider.
+                fw = max(bh + 2, inner * fr)
                 bar_col = (_balance_color(fr) if r.get("kind") == "balance"
                            else _level_color(fr))
                 d.rounded_rectangle([pad * S, by, pad * S + fw, by + bh],
