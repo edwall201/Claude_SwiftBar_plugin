@@ -75,16 +75,18 @@ CONSOLE_HEADERS = {
 # Meta Muse (muse.ai) usage — the numbers behind its Settings › General › Usage
 # panel. Muse is a Next.js app with no REST usage endpoint: the panel calls a
 # server action (POST / with a `Next-Action` header). That action id is a build
-# hash, so it may change when Muse redeploys; if the row turns into an error,
-# re-capture it from DevTools (the POST to / whose response has "percentUsed").
+# hash, so it changes when Muse redeploys (the server then answers 404 "Server
+# action not found"). The row says so; re-paste the request via "Update Muse
+# cookie…" as Copy as cURL and the new id lands in MUSE_ACTION_FILE, which
+# overrides the default below.
 MUSE_COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_cookie")
+MUSE_ACTION_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_action")
 MUSE_CACHE_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_cache.json")
 MUSE_URL = "https://muse.ai/"
 MUSE_ACTION_ID = "409a453bab86cadab1629915e1baf2d9c1701284be"
 MUSE_HEADERS = {
     "Accept": "text/x-component",
     "Content-Type": "text/plain;charset=UTF-8",
-    "Next-Action": MUSE_ACTION_ID,
     "Origin": "https://muse.ai",
     "Referer": "https://muse.ai/",
     # Muse's middleware 403s requests without the fetch-metadata headers a
@@ -434,34 +436,50 @@ def fetch_credits():
 
 
 def fetch_muse():
-    """Muse subscription/usage via its settings server action. Returns the
-    `subscription` dict (usage.percentUsed, usage.resetsAt epoch secs,
-    topupBalance, topupTotal, ...) or None when there's no cookie or it fails."""
+    """Muse subscription/usage via its settings server action. Returns (sub, err):
+    sub is the `subscription` dict (usage.percentUsed, usage.resetsAt epoch secs,
+    topupBalance, topupTotal, ...) or None; err is a short tag — 'nocookie',
+    'action' (Muse redeployed, the action id is stale), 'auth' (cookie expired),
+    'net', 'parse', or 'httpNNN'."""
     cookie = read_file_cookie(MUSE_COOKIE_FILE)
     if not cookie:
-        return None
+        return None, "nocookie"
+    action = read_file_cookie(MUSE_ACTION_FILE) or MUSE_ACTION_ID
     args = ["/usr/bin/curl", "--silent", "--show-error", "--http1.1",
-            "--max-time", "8", "-X", "POST",
-            "-H", "Cookie: " + cookie, "--data", '[{"includeAgreement":true}]']
+            "--max-time", "8", "-X", "POST", "-w", "\n%{http_code}",
+            "-H", "Cookie: " + cookie, "-H", "Next-Action: " + action,
+            "--data", '[{"includeAgreement":true}]']
     for k, v in MUSE_HEADERS.items():
         args += ["-H", "{}: {}".format(k, v)]
     args.append(MUSE_URL)
     try:
         out = subprocess.run(args, capture_output=True, text=True, timeout=13)
     except Exception:
-        return None
+        return None, "net"
+    if out.returncode != 0:
+        return None, "net"
+    body, _, code = out.stdout.rpartition("\n")
+    status = int(code) if code.strip().isdigit() else 0
+    if status == 404:
+        return None, "action"
+    if status in (401, 403) or 300 <= status < 400:
+        return None, "auth"
+    if status != 200:
+        return None, "http{}".format(status)
     # React Server Components stream: one "<id>:<json>" record per line; the
     # action's return value is the record holding "subscription".
-    for line in (out.stdout or "").splitlines():
+    for line in body.splitlines():
         _, _, payload = line.partition(":")
         if '"subscription"' not in payload:
             continue
         try:
             sub = json.loads(payload).get("subscription")
         except Exception:
-            return None
-        return sub if isinstance(sub, dict) else None
-    return None
+            break
+        if isinstance(sub, dict):
+            return sub, None
+        break
+    return None, "parse"
 
 
 def fetch_chatgpt():
@@ -547,24 +565,42 @@ def prompt_console_cookie():
         pass
 
 
+def save_muse_request(text):
+    """Store what was pasted in the Muse dialog: a whole "Copy as cURL" (cookie
+    and Next-Action id), a bare Next-Action id, or a bare Cookie value."""
+    if re.fullmatch(r"[0-9a-f]{40,}", text):
+        action, cookie = text, None
+    elif text.startswith("curl "):
+        a = re.search(r"next-action:\s*([0-9a-f]{40,})", text, re.I)
+        c = (re.search(r"(?:-b|--cookie)\s+\$?'([^']*)'", text)
+             or re.search(r"-H\s+\$?'cookie:\s*([^']*)'", text, re.I))
+        action, cookie = a and a.group(1), c and c.group(1)
+    else:
+        action, cookie = None, text
+    for path, value in ((MUSE_ACTION_FILE, action), (MUSE_COOKIE_FILE, cookie)):
+        if value:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(value)
+            os.chmod(path, 0o600)
+
+
 def prompt_muse_cookie():
-    """Pop a native dialog to paste the muse.ai cookie, then save it privately."""
-    msg = ("Paste your muse.ai cookie.\\n\\n"
-           "muse.ai → open DevTools (⌥⌘I) → Network, open Settings, click the "
-           "POST request to muse.ai/ (its response has percentUsed), then copy "
-           "the whole 'Cookie' value from its Request Headers.")
+    """Pop a native dialog to paste the muse.ai request, then save it privately."""
+    msg = ("Paste your muse.ai usage request.\\n\\n"
+           "muse.ai → open DevTools (⌥⌘I) → Network, open Settings, right-click "
+           "the POST request to muse.ai/ (its response has percentUsed) → Copy → "
+           "Copy as cURL. Just its Cookie value, or just its Next-Action id, "
+           "also works.")
     osa = ('set t to text returned of (display dialog "{}" default answer "" '
            'with title "Claude Usage — set Muse cookie" '
            'buttons {{"Cancel", "Save"}} default button "Save")').format(msg)
     try:
         out = subprocess.run(["osascript", "-e", osa],
                              capture_output=True, text=True, timeout=180)
-        cookie = (out.stdout or "").strip()
-        if cookie:
-            os.makedirs(os.path.dirname(MUSE_COOKIE_FILE), exist_ok=True)
-            with open(MUSE_COOKIE_FILE, "w") as fh:
-                fh.write(cookie)
-            os.chmod(MUSE_COOKIE_FILE, 0o600)
+        text = (out.stdout or "").strip()
+        if text:
+            save_muse_request(text)
     except Exception:
         pass
 
@@ -650,12 +686,25 @@ def main():
                      "frac": frac, "divider": True, "kind": "balance"})
 
     # Meta Muse: weekly plan usage + prepaid top-up tokens. Best-effort like the
-    # credit balance — hidden until a muse.ai cookie is set.
-    muse = fetch_muse()
+    # credit balance — hidden until a muse.ai cookie is set. Only a network blip
+    # falls back to the cache, and only while that cached week is still running;
+    # a dead request (Muse redeployed, cookie expired) shows as an error row
+    # instead of quietly repeating an old week's number.
+    muse, muse_err = fetch_muse()
     if muse is not None:
         save_cache(muse, MUSE_CACHE_FILE)
-    elif read_file_cookie(MUSE_COOKIE_FILE):
+    elif muse_err == "net":
         muse = load_cache(MUSE_CACHE_FILE)
+        ra = ((muse.get("usage") or {}).get("resetsAt")
+              if isinstance(muse, dict) else None)
+        if not isinstance(ra, (int, float)) or ra <= now.timestamp():
+            muse = None
+    if muse is None and muse_err != "nocookie":
+        hint = {"action": "Muse updated · re-paste cURL",
+                "auth": "cookie expired · re-set it",
+                "net": "couldn't reach muse.ai"}.get(muse_err, "couldn't load ({})".format(muse_err))
+        rows.append({"label": "Muse · weekly", "value": hint,
+                     "frac": 0.0, "divider": True})
     if isinstance(muse, dict):
         u = muse.get("usage") or {}
         pct = u.get("percentUsed")
