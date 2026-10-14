@@ -101,7 +101,7 @@ MUSE_COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_cookie")
 MUSE_ACTION_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_action")
 MUSE_CACHE_FILE = os.path.expanduser("~/.claude/.usage_monitor_muse_cache.json")
 MUSE_URL = "https://muse.ai/"
-MUSE_ACTION_ID = "4050123b51ffb1f6f8072de6bc4f525b54e7c950e7"   # fetchSubscriptionAction
+MUSE_ACTION_ID = "4036d6bde5675a11050ba512660053aa7825fbfcd7"   # fetchSubscriptionAction
 MUSE_HEADERS = {
     "Accept": "text/x-component",
     "Content-Type": "text/plain;charset=UTF-8",
