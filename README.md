@@ -26,7 +26,8 @@ open -a SwiftBar
 The Claude-monster icon appears in your menu bar within a few seconds and
 refreshes every 30 seconds automatically.
 
-> **5-hour & weekly rows are hidden until you set your cookie** — see
+> **5-hour & weekly rows come from your installed Claude Code** — if it's
+> signed in, there's nothing to set up. Without it, see
 > [Set your claude.ai cookie](#set-your-claudeai-cookie) below.
 
 ---
@@ -42,7 +43,9 @@ Click the monster icon to open the panel:
 | **5-hour limit** | Your rolling 5-hour usage, percentage used + time until reset. |
 | **Weekly · all models** | 7-day usage across all models. |
 | **Weekly · Sonnet** | 7-day Sonnet-only usage (shown only when Anthropic reports it separately). |
+| **Extra usage** | Extra-usage credits spent this month against your cap, and whether it's on — from Claude Code. |
 | **Credit balance** | Your prepaid API credit balance from platform.claude.com — shown only after setting the console cookie (optional). |
+| **ChatGPT · weekly / 5-hour** | ChatGPT usage limits from your installed Codex (or the chatgpt.com cookie). |
 
 Each row shows a **percentage**, a **"resets in …"** countdown, and a
 **progress bar** that shifts blue → orange (≥ 60 %) → red (≥ 85 %) as you
@@ -57,14 +60,16 @@ when full, orange → red as it drains.
 - **Python 3** (pre-installed on macOS, or from python.org / Homebrew)
 - **[Pillow](https://pypi.org/project/Pillow/)** — for the rendered image panel.
   Without it the plugin still works, falling back to plain text rows.
-- A **claude.ai account** — needed only for the 5-hour / weekly rows
+- **Claude Code** signed in to a claude.ai plan for the 5-hour / weekly / extra-usage rows
+  (or a claude.ai cookie instead), and optionally **Codex** for the ChatGPT rows
 
 ---
 
 ## Set your claude.ai cookie
 
-The 5-hour and weekly rows call Anthropic's official usage endpoint
-(`Settings › Usage`), which requires your `claude.ai` session cookie.
+Only needed when Claude Code isn't installed or signed in: the 5-hour and
+weekly rows then call Anthropic's official usage endpoint (`Settings › Usage`),
+which requires your `claude.ai` session cookie.
 
 1. Open <https://claude.ai/settings/usage> while signed in.
 2. Open DevTools (**⌥⌘I**) → **Network** tab, then refresh the page.
@@ -143,6 +148,9 @@ The `30s` in the filename tells SwiftBar to auto-refresh every 30 seconds.
 | *Cookie expired — set it again* | Session expired — grab a fresh cookie and use **Update cookie…** |
 | *Couldn't find your org id — re-set the cookie* | The pasted cookie is missing the org token; copy the **whole** Cookie header again |
 | *Couldn't reach claude.ai (offline?)* | Network blip — cached data shown until it reconnects |
+| *Claude Code signed out — run claude, or set a cookie* | Run `claude` and `/login`, or set a claude.ai cookie |
+| *Install Claude Code or set a claude.ai cookie* | Neither source is available |
+| *ChatGPT · Codex signed out · codex login* | Run `codex login`, or set a ChatGPT cookie |
 | Rows show as plain text, not an image panel | Pillow isn't installed for the plugin's Python — see [Requirements](#requirements) |
 | Nothing appears in the menu bar | Confirm the file is executable and SwiftBar points at `plugins/` |
 
@@ -150,11 +158,20 @@ The `30s` in the filename tells SwiftBar to auto-refresh every 30 seconds.
 
 ## How it works
 
-**5-hour & weekly:** calls `GET https://claude.ai/api/organizations/{org}/usage`
+**5-hour, weekly & extra usage:** asks the installed Claude Code, the way
+[agent-hud](https://github.com/jazzenchen/agent-hud-open/blob/main/docs/providers.md)
+does: a headless `claude -p --input-format stream-json` gets one `get_usage`
+control request. No prompt is sent and nothing is billed; Claude Code uses (and
+refreshes) its own sign-in. If that fails, it falls back to
+`GET https://claude.ai/api/organizations/{org}/usage`
 — the same endpoint that powers Settings › Usage — authenticated with your
 `claude.ai` cookie. Uses `curl --http1.1` to avoid Cloudflare's HTTP/2
 fingerprinting. `utilization` percentages and `resets_at` times come directly
 from Anthropic, so they match the official panel exactly.
+
+**ChatGPT:** asks the installed Codex (`codex app-server`, JSON-RPC
+`account/rateLimits/read`), falling back to chatgpt.com's `wham/usage` with the
+ChatGPT cookie. The monthly credit cap still needs that cookie.
 
 **Credit balance:** calls `GET https://platform.claude.com/api/organizations/{org}/prepaid/credits`
 with your platform.claude.com cookie — the same data shown on the Billing page.

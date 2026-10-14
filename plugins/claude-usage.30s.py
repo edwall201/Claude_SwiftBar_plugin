@@ -11,18 +11,23 @@
 # <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
 #
-# SwiftBar/xbar plugin. Shows the official 5-hour and weekly usage limits from
-# claude.ai's usage endpoint, plus (optionally) the platform.claude.com prepaid
-# credit balance, Meta Muse (muse.ai) weekly usage / extra tokens, and ChatGPT
-# usage limits.
+# SwiftBar/xbar plugin. Shows the official 5-hour and weekly usage limits and
+# extra-usage credits (asked of the installed Claude Code), plus (optionally) the
+# platform.claude.com prepaid credit balance, Meta Muse (muse.ai) weekly usage /
+# extra tokens, and ChatGPT usage limits (asked of the installed Codex).
 
 import os
 import sys
 import io
 import json
 import re
+import glob
+import pwd
+import shutil
 import base64
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -31,11 +36,24 @@ try:
 except Exception:
     HAVE_PIL = False
 
-# The session / weekly numbers come from Anthropic's own usage endpoint — the
-# exact data behind Settings › Usage — authenticated with your claude.ai browser
-# cookie. We keep the cookie and a small cache of the last good response under
-# ~/.claude (outside the repo). The cookie is a live session credential, so the
-# file is written 0600 (user-only) and never printed in the menu.
+# Claude and ChatGPT limits come from the CLIs' own engines, the way agent-hud
+# does it (github.com/jazzenchen/agent-hud-open, docs/providers.md): a headless
+# `claude -p` answers a `get_usage` control request and `codex app-server`
+# answers `account/rateLimits/read`. Neither sends a prompt or bills anything,
+# and both use the CLI's own sign-in, which it refreshes itself — so no cookie to
+# paste or expire. SwiftBar runs plugins with a bare PATH, so look in the usual
+# install places first.
+BIN_DIRS = [os.path.expanduser("~/.local/bin"), os.path.expanduser("~/.claude/local"),
+            "/opt/homebrew/bin", "/usr/local/bin"]
+BIN_DIRS += sorted(glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin")), reverse=True)
+CODEX_APP_BIN = "/Applications/Codex.app/Contents/Resources/codex"
+
+# Fallback for the session / weekly numbers when Claude Code isn't installed or
+# signed in: Anthropic's own usage endpoint — the exact data behind Settings ›
+# Usage — authenticated with your claude.ai browser cookie. We keep the cookie
+# and a small cache of the last good response under ~/.claude (outside the
+# repo). The cookie is a live session credential, so the file is written 0600
+# (user-only) and never printed in the menu.
 COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_cookie")
 CACHE_FILE = os.path.expanduser("~/.claude/.usage_monitor_cache.json")
 USAGE_URL = "https://claude.ai/api/organizations/{org}/usage"
@@ -97,8 +115,9 @@ MUSE_HEADERS = {
     "User-Agent": USAGE_HEADERS["User-Agent"],
 }
 
-# ChatGPT usage — the numbers behind chatgpt.com Settings › Usage. The cookie
-# alone can't call backend-api: /api/auth/session trades it for a short-lived
+# ChatGPT usage — the numbers behind chatgpt.com Settings › Usage. Codex gives
+# the usage windows; the cookie is only needed for the monthly credit cap (and
+# as the fallback without Codex). The cookie alone can't call backend-api: /api/auth/session trades it for a short-lived
 # bearer token first (the same thing the web app does on load). Like claude.ai,
 # Cloudflare only lets curl through over HTTP/1.1.
 CHATGPT_COOKIE_FILE = os.path.expanduser("~/.claude/.usage_monitor_chatgpt_cookie")
@@ -393,6 +412,95 @@ def get_org_id(cookie):
         return None
 
 
+def find_bin(name, *extra):
+    for path in list(extra) + [os.path.join(d, name) for d in BIN_DIRS]:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which(name)
+
+
+def _stream_rpc(args, messages, pick, timeout=15):
+    """Start a CLI that speaks newline-delimited JSON on stdio, send `messages`,
+    and return the first reply `pick` accepts — or None if it exits, times out
+    or can't start. The process is killed either way."""
+    # Claude Code looks up its keychain login under $USER; without it (a bare
+    # plugin environment) it reports itself signed out.
+    env = dict(os.environ)
+    env.setdefault("USER", pwd.getpwuid(os.getuid()).pw_name)
+    try:
+        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, cwd="/tmp", env=env)
+    except OSError:
+        return None
+    timer = threading.Timer(timeout, p.kill)
+    timer.start()
+    try:
+        for m in messages:
+            p.stdin.write(json.dumps(m) + "\n")
+        p.stdin.flush()
+        for line in p.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if pick(msg):
+                return msg
+    except (OSError, ValueError):
+        pass
+    finally:
+        timer.cancel()
+        p.kill()
+        p.wait()
+    return None
+
+
+def fetch_claude_engine():
+    """Claude Code's own view of the plan limits. Returns (rate_limits, err):
+    rate_limits has the usage endpoint's window keys (five_hour / seven_day /
+    seven_day_sonnet ...) plus extra_usage and spend; err is a short tag —
+    'noclaude' (not installed), 'signedout' (logged out, or an API-key login
+    with no plan limits), or 'engine' (no answer)."""
+    exe = find_bin("claude")
+    if not exe:
+        return None, "noclaude"
+    msg = _stream_rpc(
+        [exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+         "--verbose", "--settings", '{"disableAllHooks":true}'],
+        [{"type": "control_request", "request_id": "usage",
+          "request": {"subtype": "get_usage", "skip_behaviors": True}}],
+        lambda m: m.get("type") == "control_response")
+    resp = (msg or {}).get("response") or {}
+    if resp.get("subtype") != "success":
+        return None, "engine"
+    body = resp.get("response") or {}
+    if not body.get("rate_limits_available") or not isinstance(body.get("rate_limits"), dict):
+        return None, "signedout"
+    return body["rate_limits"], None
+
+
+def fetch_codex():
+    """Codex's own view of the ChatGPT limits (`account/rateLimits/read`).
+    Returns (result, err): result has rateLimits / rateLimitsByLimitId with
+    primary/secondary windows and credits; err is 'nocodex', 'signedout' or
+    'engine'."""
+    exe = find_bin("codex", CODEX_APP_BIN)
+    if not exe:
+        return None, "nocodex"
+    msg = _stream_rpc(
+        [exe, "app-server", "--listen", "stdio://"],
+        [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+          "params": {"clientInfo": {"name": "claude-usage", "version": "1.0"}}},
+         {"jsonrpc": "2.0", "method": "initialized"},
+         {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"}],
+        lambda m: m.get("id") == 2)
+    if msg and isinstance(msg.get("result"), dict):
+        return msg["result"], None
+    text = json.dumps((msg or {}).get("error") or "").lower()
+    if any(w in text for w in ("auth", "login", "sign")):
+        return None, "signedout"
+    return None, "engine"
+
+
 def fetch_usage(cookie):
     """Hit Anthropic's official usage endpoint. Returns (data, error): data is the
     raw JSON dict (five_hour / seven_day / seven_day_sonnet) or None; error is a
@@ -485,14 +593,11 @@ def fetch_muse():
     return None, "parse"
 
 
-def fetch_chatgpt():
-    """ChatGPT usage limits. Returns (data, err): data is {'usage': wham/usage
-    dict (rate_limit with primary/secondary windows), 'monthly': monthly credit
-    usage dict or None} or None; err is a short tag — 'nocookie', 'auth' (cookie
-    expired), 'net', or 'httpNNN'."""
-    cookie = read_file_cookie(CHATGPT_COOKIE_FILE)
-    if not cookie:
-        return None, "nocookie"
+def fetch_chatgpt_web(cookie, with_usage=True):
+    """chatgpt.com via the browser cookie. Returns (usage, monthly, err): usage is
+    the wham/usage dict (skipped unless with_usage), monthly the monthly credit
+    usage dict or None; err is 'auth' (cookie expired), 'net', or 'httpNNN'."""
+    usage = None
     try:
         sess = _get_json(CHATGPT_SESSION_URL, cookie, headers=CHATGPT_HEADERS)
         token = sess.get("accessToken")
@@ -500,13 +605,14 @@ def fetch_chatgpt():
         # token lapses (~10 days) and the refresh token has been rotated by the
         # browser, still hands back that dead token alongside this error.
         if not token or sess.get("error") == "RefreshAccessTokenError":
-            return None, "auth"
+            return None, None, "auth"
         auth = dict(CHATGPT_HEADERS, Authorization="Bearer " + token)
-        usage = _get_json(CHATGPT_USAGE_URL, cookie, headers=auth)
+        if with_usage:
+            usage = _get_json(CHATGPT_USAGE_URL, cookie, headers=auth)
     except _HttpError as e:
-        return None, "auth" if e.code in (401, 403) else "http{}".format(e.code)
+        return None, None, "auth" if e.code in (401, 403) else "http{}".format(e.code)
     except Exception:
-        return None, "net"
+        return None, None, "net"
     monthly = None
     acct = (sess.get("account") or {}).get("id")
     if acct:
@@ -514,7 +620,48 @@ def fetch_chatgpt():
             monthly = _get_json(CHATGPT_MONTHLY_URL.format(acct=acct), cookie, headers=auth)
         except Exception:
             pass
-    return {"usage": usage, "monthly": monthly}, None
+    return usage, monthly, None
+
+
+def fetch_chatgpt():
+    """ChatGPT usage limits, from Codex when it's installed and signed in, else
+    from the chatgpt.com cookie. Returns (data, err): data is {'windows': [{'name',
+    'mins', 'pct', 'reset' (epoch secs)}], 'credits': Codex's credits dict or
+    None, 'monthly': monthly credit usage dict or None} or None; err is a short
+    tag — 'nocookie' (neither source set up), 'signedout' / 'engine' (Codex),
+    'auth' (cookie expired), 'net', or 'httpNNN'."""
+    cookie = read_file_cookie(CHATGPT_COOKIE_FILE)
+    res, err = fetch_codex()
+    if res is not None:
+        buckets = res.get("rateLimitsByLimitId") or {"codex": res.get("rateLimits")}
+        windows = []
+        for lid in sorted(buckets, key=lambda k: k != "codex"):
+            b = buckets[lid]
+            if not isinstance(b, dict):
+                continue
+            name = "" if lid == "codex" else (b.get("limitName") or lid)
+            for key in ("primary", "secondary"):
+                w = b.get(key)
+                if isinstance(w, dict) and isinstance(w.get("usedPercent"), (int, float)):
+                    windows.append({"name": name, "mins": w.get("windowDurationMins"),
+                                    "pct": w["usedPercent"], "reset": w.get("resetsAt")})
+        credits = (buckets.get("codex") or res.get("rateLimits") or {}).get("credits")
+        # The monthly cap isn't in Codex's answer; it still needs the cookie.
+        monthly = fetch_chatgpt_web(cookie, with_usage=False)[1] if cookie else None
+        return {"windows": windows, "credits": credits, "monthly": monthly}, None
+    if not cookie:
+        return None, "nocookie" if err == "nocodex" else err
+    usage, monthly, err = fetch_chatgpt_web(cookie)
+    if err:
+        return None, err
+    rl = usage.get("rate_limit") or {}
+    windows = []
+    for key in ("primary_window", "secondary_window"):
+        w = rl.get(key)
+        if isinstance(w, dict) and isinstance(w.get("used_percent"), (int, float)):
+            windows.append({"name": "", "mins": (w.get("limit_window_seconds") or 0) // 60,
+                            "pct": w["used_percent"], "reset": w.get("reset_at")})
+    return {"windows": windows, "credits": None, "monthly": monthly}, None
 
 
 def load_cache(path=CACHE_FILE):
@@ -643,13 +790,21 @@ def main():
     BAR_W = 40
     script = os.path.abspath(__file__)
 
-    # Session + weekly: the real numbers straight from Anthropic's usage endpoint.
+    # Codex and Claude Code each take a second or so to answer; ask both at once.
+    pool = ThreadPoolExecutor(max_workers=1)
+    gpt_job = pool.submit(fetch_chatgpt)
+
+    # Session + weekly: Claude Code's own numbers, else the usage endpoint via the
+    # claude.ai cookie (same window keys either way).
     cookie = read_cookie()
-    data, err = fetch_usage(cookie)
+    data, err = fetch_claude_engine()
+    via_engine = data is not None
+    if data is None and cookie:
+        data, err = fetch_usage(cookie)
     stale = False
     if data is not None:
         save_cache(data)                 # remember the last good snapshot
-    elif err == "net":
+    elif err in ("net", "engine"):
         data = load_cache()              # transient outage: show what we last saw
         stale = data is not None
 
@@ -673,6 +828,25 @@ def main():
         else:
             value = "{:.0f}%".format(fr * 100)
         rows.append({"label": label, "value": value, "frac": fr, "divider": div})
+
+    # Extra usage: the credits that take over once the plan limits are hit
+    # (claude.ai Settings › Usage). Only Claude Code's answer carries it.
+    ex = (data or {}).get("extra_usage")
+    if isinstance(ex, dict) and isinstance(ex.get("monthly_limit"), (int, float)) and ex["monthly_limit"] > 0:
+        scale = 10 ** (ex.get("decimal_places") or 2)
+        used, cap = (ex.get("used_credits") or 0) / scale, ex["monthly_limit"] / scale
+        sym = "$" if (ex.get("currency") or "USD") == "USD" else ex["currency"] + " "
+        value = "{0}{1:.2f} of {0}{2:.2f}".format(sym, used, cap)
+        if not ex.get("is_enabled"):
+            value += " · off"
+        rows.append({"label": "Extra usage", "value": value,
+                     "frac": used / cap, "divider": False})
+    bal = ((data or {}).get("spend") or {}).get("balance")
+    if isinstance(bal, dict) and isinstance(bal.get("amount_minor"), (int, float)):
+        amount = bal["amount_minor"] / 10 ** (bal.get("exponent") or 2)
+        sym = "$" if (bal.get("currency") or "USD") == "USD" else bal["currency"] + " "
+        rows.append({"label": "Usage credit balance", "value": "{}{:.2f}".format(sym, amount),
+                     "frac": 1.0 if amount > 0 else 0.0, "divider": False, "kind": "balance"})
 
     # API prepaid credit balance (platform.claude.com console). Separate login, so
     # this is best-effort: the row only shows when that cookie is set and the call
@@ -738,43 +912,52 @@ def main():
 
     # ChatGPT: rolling usage windows (weekly on every plan; Plus/Pro also get a
     # 5-hour one) plus the monthly credit cap when the account has one set.
-    # Same cache rule as Muse: only a network blip, and only while none of the
-    # cached windows has reset since.
-    gpt, gpt_err = fetch_chatgpt()
+    # Same cache rule as Muse: only a network blip (or Codex not answering), and
+    # only while none of the cached windows has reset since.
+    gpt, gpt_err = gpt_job.result()
+    pool.shutdown()
     if gpt is not None:
         save_cache(gpt, CHATGPT_CACHE_FILE)
-    elif gpt_err == "net":
+    elif gpt_err in ("net", "engine"):
         gpt = load_cache(CHATGPT_CACHE_FILE)
-        rl = (((gpt.get("usage") or {}).get("rate_limit") or {})
-              if isinstance(gpt, dict) else {})
-        resets = [w.get("reset_at") for w in (rl.get("primary_window"), rl.get("secondary_window"))
-                  if isinstance(w, dict)]
+        resets = [w.get("reset") for w in ((gpt.get("windows") or [])
+                                           if isinstance(gpt, dict) else [])]
         if not resets or not all(isinstance(r, (int, float)) and r > now.timestamp()
                                  for r in resets):
             gpt = None
     if gpt is None and gpt_err != "nocookie":
         hint = {"auth": "cookie expired · re-set it",
+                "signedout": "Codex signed out · codex login",
+                "engine": "Codex didn't answer",
                 "net": "couldn't reach chatgpt.com"}.get(gpt_err, "couldn't load ({})".format(gpt_err))
         rows.append({"label": "ChatGPT · weekly", "value": hint,
                      "frac": 0.0, "divider": True})
     if isinstance(gpt, dict):
         first = True
-        rl = (gpt.get("usage") or {}).get("rate_limit") or {}
-        for key in ("primary_window", "secondary_window"):
-            w = rl.get(key)
-            if not isinstance(w, dict) or not isinstance(w.get("used_percent"), (int, float)):
-                continue
-            secs = w.get("limit_window_seconds") or 0
-            span = {18000: "5-hour", 604800: "weekly"}.get(secs, "{}h".format(secs // 3600))
-            pct = w["used_percent"]
+        for w in gpt.get("windows") or []:
+            mins = w.get("mins") or 0
+            span = {300: "5-hour", 1440: "daily", 10080: "weekly"}.get(mins, "{}h".format(mins // 60))
+            pct = w["pct"]
             value = "{:.0f}%".format(pct)
-            ra = w.get("reset_at")
+            ra = w.get("reset")
             if isinstance(ra, (int, float)):
                 reset = datetime.fromtimestamp(ra, timezone.utc).astimezone()
                 if reset > now:
                     value += " · resets {}".format(fmt_hm(reset - now))
-            rows.append({"label": "ChatGPT · " + span, "value": value,
+            label = " ".join(filter(None, ("ChatGPT ·", w.get("name"), span)))
+            rows.append({"label": label, "value": value,
                          "frac": pct / 100.0, "divider": first})
+            first = False
+        cr = gpt.get("credits") or {}
+        try:
+            left = float(cr["balance"]) if cr.get("balance") is not None else None
+        except (TypeError, ValueError):
+            left = None
+        if cr.get("unlimited") or left is not None:
+            rows.append({"label": "ChatGPT · credits",
+                         "value": "unlimited" if cr.get("unlimited") else "{:g} left".format(left),
+                         "frac": 1.0 if cr.get("unlimited") or left > 0 else 0.0,
+                         "divider": first, "kind": "balance"})
             first = False
         mo = gpt.get("monthly") or {}
         cap = (mo.get("effective_monthly_limit") or {}).get("limit")
@@ -809,12 +992,15 @@ def main():
             "noorg": "Couldn't find your org id — re-set the cookie",
             "auth": "Cookie expired — set it again",
             "net": "Couldn't reach claude.ai (offline?)",
+            "noclaude": "Install Claude Code or set a claude.ai cookie",
+            "signedout": "Claude Code signed out — run claude, or set a cookie",
+            "engine": "Claude Code didn't answer",
         }.get(err, "Couldn't load usage ({})".format(err))
         print("⚠ {} | color=#cc6600".format(hint))
     elif stale:
         print("⚠ showing last good data (couldn't refresh) | color=#999999 size=11")
     else:
-        print("✓ Live | color=#999999 size=11")
+        print("✓ Live{} | color=#999999 size=11".format(" · via Claude Code" if via_engine else ""))
 
     label = "Update cookie…" if cookie else "Set claude.ai cookie…"
     print("{} | bash=\"{}\" param1=--set-cookie terminal=false refresh=true".format(label, script))
